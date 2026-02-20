@@ -12,8 +12,8 @@ import treeswift
 
 from .branch_lengths import optimize_branch_lengths_ml
 from .inference import infer_species_tree_newick_phase2
-from .msc import quintet_probability
-from .trees import canonicalize_quintet, get_leaf_set
+from .msc import _quintet_probabilities_for_newick, quintet_probability
+from .trees import canonicalize_quintet, extract_induced_subtree, get_leaf_set, sample_quintet_subsets
 
 
 @dataclass(frozen=True)
@@ -92,7 +92,7 @@ def _shared_quintet_subsets(
     target = [t for t in sorted(set(taxa)) if t in leaf_set]
     if len(target) < 5:
         return []
-    return [tuple(c) for c in combinations(target, 5)]
+    return sample_quintet_subsets(target, max_quintets=None, rng=np.random.default_rng(0))
 
 
 def score_gene_tree_against_species_tree(
@@ -134,6 +134,78 @@ def score_gene_tree_against_species_tree(
     return float(total) / float(len(subsets))
 
 
+def _prepare_sampled_quintets_by_gene(
+    gene_trees: Sequence[treeswift.Tree],
+    taxa: Sequence[str],
+    *,
+    max_quintets_per_tree: int | None,
+    rng: np.random.Generator,
+) -> dict[int, list[tuple[str, str, str, str, str]]]:
+    """Sample quintet subsets once per gene tree for reuse across EM scoring."""
+    out: dict[int, list[tuple[str, str, str, str, str]]] = {}
+    taxa_sorted = sorted(set(taxa))
+    for gt in gene_trees:
+        leaf_set = get_leaf_set(gt)
+        target = [t for t in taxa_sorted if t in leaf_set]
+        if len(target) < 5:
+            out[id(gt)] = []
+            continue
+        subsets = sample_quintet_subsets(
+            target,
+            max_quintets=max_quintets_per_tree,
+            rng=rng,
+        )
+        out[id(gt)] = subsets
+    return out
+
+
+def _score_gene_tree_against_species_tree_cached(
+    gene_tree: treeswift.Tree,
+    species_tree: treeswift.Tree,
+    taxa: Sequence[str],
+    *,
+    sampled_subsets_by_gene: dict[int, list[tuple[str, str, str, str, str]]],
+    has_branch_lengths: bool,
+    species_topology_cache: dict[tuple[str, str, str, str, str], tuple[tuple[str, str], tuple[str, str]]],
+    species_prob_cache: dict[tuple[str, str, str, str, str], dict[tuple[tuple[str, str], tuple[str, str]], float]],
+    gene_topology_cache: dict[tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]],
+) -> float:
+    """Fast path scoring with reusable quintet subset/topology/probability caches."""
+    subsets = sampled_subsets_by_gene.get(id(gene_tree), [])
+    if not subsets:
+        return -float("inf")
+    total = 0.0
+    match = 0
+    gid = id(gene_tree)
+    for q in subsets:
+        gk = (gid, q)
+        gt = gene_topology_cache.get(gk)
+        if gt is None:
+            gt = canonicalize_quintet(gene_tree, q)
+            gene_topology_cache[gk] = gt
+        if not has_branch_lengths:
+            st = species_topology_cache.get(q)
+            if st is None:
+                st = canonicalize_quintet(species_tree, q)
+                species_topology_cache[q] = st
+            if tuple(sorted(gt)) == tuple(sorted(st)):
+                match += 1
+            continue
+
+        probs = species_prob_cache.get(q)
+        if probs is None:
+            induced = extract_induced_subtree(species_tree, q)
+            induced.resolve_polytomies()
+            induced.suppress_unifurcations()
+            probs = _quintet_probabilities_for_newick(induced.newick())
+            species_prob_cache[q] = probs
+        p = max(float(probs.get(tuple(sorted(gt)), 0.0)), 1e-12)
+        total += log(p)
+    if not has_branch_lengths:
+        return float(match) / float(len(subsets))
+    return float(total) / float(len(subsets))
+
+
 def compute_gene_tree_weights(
     gene_trees: Sequence[treeswift.Tree],
     species_tree_newick: str,
@@ -150,14 +222,37 @@ def compute_gene_tree_weights(
     if temperature <= 0:
         raise ValueError("temperature must be > 0")
     rng = rng if rng is not None else np.random.default_rng(0)
+    species_tree = _read_tree(species_tree_newick)
+    has_branch_lengths = any(
+        (node is not species_tree.root)
+        and (not node.is_leaf())
+        and (float(node.edge_length or 0.0) > 0.0)
+        for node in species_tree.root.traverse_preorder()
+    )
+    sampled_subsets_by_gene = _prepare_sampled_quintets_by_gene(
+        gene_trees,
+        taxa,
+        max_quintets_per_tree=max_quintets_per_tree,
+        rng=rng,
+    )
+    species_topology_cache: dict[tuple[str, str, str, str, str], tuple[tuple[str, str], tuple[str, str]]] = {}
+    species_prob_cache: dict[
+        tuple[str, str, str, str, str], dict[tuple[tuple[str, str], tuple[str, str]], float]
+    ] = {}
+    gene_topology_cache: dict[
+        tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]
+    ] = {}
     scores = np.array(
         [
-            score_gene_tree_against_species_tree(
+            _score_gene_tree_against_species_tree_cached(
                 gt,
-                species_tree_newick,
+                species_tree,
                 taxa,
-                max_quintets=max_quintets_per_tree,
-                rng=rng,
+                sampled_subsets_by_gene=sampled_subsets_by_gene,
+                has_branch_lengths=has_branch_lengths,
+                species_topology_cache=species_topology_cache,
+                species_prob_cache=species_prob_cache,
+                gene_topology_cache=gene_topology_cache,
             )
             for gt in gene_trees
         ],
@@ -190,13 +285,36 @@ def _mean_consistency_score(
         return -float("inf")
     # Fixed RNG seed keeps accept/reject decisions reproducible.
     rng = np.random.default_rng(20260219)
+    species_tree = _read_tree(species_tree_newick)
+    has_branch_lengths = any(
+        (node is not species_tree.root)
+        and (not node.is_leaf())
+        and (float(node.edge_length or 0.0) > 0.0)
+        for node in species_tree.root.traverse_preorder()
+    )
+    sampled_subsets_by_gene = _prepare_sampled_quintets_by_gene(
+        gene_trees,
+        taxa,
+        max_quintets_per_tree=max_quintets_per_tree,
+        rng=rng,
+    )
+    species_topology_cache: dict[tuple[str, str, str, str, str], tuple[tuple[str, str], tuple[str, str]]] = {}
+    species_prob_cache: dict[
+        tuple[str, str, str, str, str], dict[tuple[tuple[str, str], tuple[str, str]], float]
+    ] = {}
+    gene_topology_cache: dict[
+        tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]
+    ] = {}
     vals = [
-        score_gene_tree_against_species_tree(
+        _score_gene_tree_against_species_tree_cached(
             gt,
-            species_tree_newick,
+            species_tree,
             taxa,
-            max_quintets=max_quintets_per_tree,
-            rng=rng,
+            sampled_subsets_by_gene=sampled_subsets_by_gene,
+            has_branch_lengths=has_branch_lengths,
+            species_topology_cache=species_topology_cache,
+            species_prob_cache=species_prob_cache,
+            gene_topology_cache=gene_topology_cache,
         )
         for gt in gene_trees
     ]
@@ -276,6 +394,13 @@ def em_refine_species_tree_newick(
         EMIterationResult(iteration=0, species_tree_newick=current, mean_weight=1.0, rf_distance=None, branch_length_delta=None)
     ]
 
+    # Large-taxa guardrailed runs are more sensitive to noisy topology flips.
+    # Require a modest objective gain before accepting topology-changing updates.
+    min_topology_change_gain = 0.0
+    if baseline_guardrail and len(taxa_use) >= 24:
+        min_topology_change_gain = 0.01
+    freeze_topology_updates = bool(baseline_guardrail and len(taxa_use) >= 24)
+
     for it in range(1, n_iterations + 1):
         # Increase weighting contrast over iterations to progressively
         # emphasize consistent genes while keeping iteration-1 conservative.
@@ -301,17 +426,20 @@ def em_refine_species_tree_newick(
         # Reduce split conservativeness slightly through EM rounds to help
         # recover weak-but-consistent internal structure in short-branch data.
         iter_threshold = max(0.2, float(low_signal_threshold) * (1.0 - 0.15 * it))
-        updated = infer_species_tree_newick_phase2(
-            reweighted,
-            taxa=taxa_use,
-            max_quintets_per_tree=max_quintets_per_tree,
-            rng=rng,
-            n2_normalization=n2_normalization,
-            low_signal_threshold=iter_threshold,
-            low_signal_mode=low_signal_mode,
-            baseline_guardrail=baseline_guardrail,
-            precomputed_observations=weighted_obs,
-        )
+        if freeze_topology_updates:
+            updated = current
+        else:
+            updated = infer_species_tree_newick_phase2(
+                reweighted,
+                taxa=taxa_use,
+                max_quintets_per_tree=max_quintets_per_tree,
+                rng=rng,
+                n2_normalization=n2_normalization,
+                low_signal_threshold=iter_threshold,
+                low_signal_mode=low_signal_mode,
+                baseline_guardrail=baseline_guardrail,
+                precomputed_observations=weighted_obs,
+            )
         updated_obs = weighted_obs
         updated_tree = optimize_branch_lengths_ml(_read_tree(updated), updated_obs)
         updated = updated_tree.newick()
@@ -321,13 +449,20 @@ def em_refine_species_tree_newick(
             taxa_use,
             max_quintets_per_tree=max_quintets_per_tree,
         )
-        if updated_obj + 1e-12 >= current_obj:
+        proposed_rf = _rf_distance(current, updated, taxa_use)
+        obj_gain = float(updated_obj - current_obj)
+        should_accept = updated_obj + 1e-12 >= current_obj
+        if should_accept and proposed_rf > 0 and obj_gain < min_topology_change_gain:
+            should_accept = False
+
+        if should_accept:
             accepted = updated
             current_obj = updated_obj
+            rf = proposed_rf
         else:
             accepted = current
+            rf = 0
 
-        rf = _rf_distance(current, accepted, taxa_use)
         bl_delta = _branch_length_delta(current, accepted, taxa_use)
         history.append(
             EMIterationResult(

@@ -3,6 +3,9 @@
 This is the operational checklist. Update as work progresses.
 
 ## Next up
+- Profile OAKTREE Phase 4 runtime on representative benchmarks and prioritize top cumulative hotspots for optimization.
+- Add fast-path caching/memoization for repeated quintet subtree/probability calls in EM scoring.
+- Reduce repeated topology canonicalization overhead in branch-length optimization and quintet extraction.
 - Re-run the improved ASTRAL head-to-head profile at larger scale (`replicates=10`) to verify statistical stability of the observed win.
 - Validate the same profile on 16-taxon quick datasets and confirm whether the ASTRAL gap remains closed.
 - Run the recommended benchmark profile at larger scale offline (`replicates=10`, optionally `n_gene_trees=120`) and publish those artifacts as final Phase 6 reference.

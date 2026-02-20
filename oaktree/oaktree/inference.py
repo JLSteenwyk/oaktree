@@ -14,6 +14,7 @@ from .trees import (
     canonicalize_quintet,
     get_leaf_set,
     get_shared_taxa,
+    sample_quintet_subsets,
 )
 
 
@@ -33,8 +34,6 @@ def extract_quintet_observations_from_gene_trees(
         return []
 
     rng = rng if rng is not None else np.random.default_rng(0)
-    quintet_subsets = [tuple(c) for c in combinations(target_taxa, 5)]
-
     if gene_weights is not None and len(gene_weights) != len(gene_trees):
         raise ValueError("gene_weights must have same length as gene_trees")
 
@@ -43,13 +42,14 @@ def extract_quintet_observations_from_gene_trees(
         tree_weight = 1.0 if gene_weights is None else float(gene_weights[i])
         if tree_weight <= 0.0:
             continue
-        leaf_set = get_leaf_set(tree)
-        usable = [q for q in quintet_subsets if set(q).issubset(leaf_set)]
-        if not usable:
+        present = [t for t in target_taxa if t in get_leaf_set(tree)]
+        if len(present) < 5:
             continue
-        if max_quintets_per_tree is not None and len(usable) > max_quintets_per_tree:
-            idx = rng.choice(len(usable), size=max_quintets_per_tree, replace=False)
-            usable = [usable[int(i)] for i in sorted(idx)]
+        usable = sample_quintet_subsets(
+            present,
+            max_quintets=max_quintets_per_tree,
+            rng=rng,
+        )
         for q in usable:
             topology = canonicalize_quintet(tree, q)
             observations.append(QuintetObservation(taxa=q, topology=topology, weight=tree_weight))
@@ -175,23 +175,83 @@ def _score_species_tree_newick(
     max_quintets_per_tree: int | None,
     rng: np.random.Generator,
 ) -> float:
-    st = _read_tree(species_tree_newick)
     taxa_use = sorted(set(taxa))
-    quintets = [tuple(c) for c in combinations(taxa_use, 5)]
-    if not quintets:
-        return 0.0
+    sampled_subsets_by_gene = _prepare_guardrail_quintet_subsets(
+        gene_trees=gene_trees,
+        taxa=taxa_use,
+        max_quintets_per_tree=max_quintets_per_tree,
+        rng=rng,
+    )
+    gene_topology_cache = _prepare_guardrail_gene_topology_cache(
+        gene_trees=gene_trees,
+        sampled_subsets_by_gene=sampled_subsets_by_gene,
+    )
+    return _score_species_tree_newick_cached(
+        gene_trees=gene_trees,
+        species_tree_newick=species_tree_newick,
+        sampled_subsets_by_gene=sampled_subsets_by_gene,
+        gene_topology_cache=gene_topology_cache,
+    )
+
+
+def _prepare_guardrail_quintet_subsets(
+    gene_trees: Sequence[treeswift.Tree],
+    taxa: Sequence[str],
+    *,
+    max_quintets_per_tree: int | None,
+    rng: np.random.Generator,
+) -> dict[int, list[tuple[str, str, str, str, str]]]:
+    taxa_use = sorted(set(taxa))
+    out: dict[int, list[tuple[str, str, str, str, str]]] = {}
+    for gt in gene_trees:
+        present = [t for t in taxa_use if t in get_leaf_set(gt)]
+        if len(present) < 5:
+            out[id(gt)] = []
+            continue
+        subsets = sample_quintet_subsets(
+            present,
+            max_quintets=max_quintets_per_tree,
+            rng=rng,
+        )
+        out[id(gt)] = subsets
+    return out
+
+
+def _prepare_guardrail_gene_topology_cache(
+    gene_trees: Sequence[treeswift.Tree],
+    *,
+    sampled_subsets_by_gene: dict[int, list[tuple[str, str, str, str, str]]],
+) -> dict[tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]]:
+    cache: dict[tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]] = {}
+    for gt in gene_trees:
+        gid = id(gt)
+        for q in sampled_subsets_by_gene.get(gid, []):
+            cache[(gid, q)] = canonicalize_quintet(gt, q)
+    return cache
+
+
+def _score_species_tree_newick_cached(
+    gene_trees: Sequence[treeswift.Tree],
+    species_tree_newick: str,
+    *,
+    sampled_subsets_by_gene: dict[int, list[tuple[str, str, str, str, str]]],
+    gene_topology_cache: dict[tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]],
+) -> float:
+    st = _read_tree(species_tree_newick)
+    species_topology_cache: dict[tuple[str, str, str, str, str], tuple[tuple[str, str], tuple[str, str]]] = {}
     per_tree = []
     for gt in gene_trees:
-        leaf_set = get_leaf_set(gt) & get_leaf_set(st)
-        usable = [q for q in quintets if set(q).issubset(leaf_set)]
+        gid = id(gt)
+        usable = sampled_subsets_by_gene.get(gid, [])
         if not usable:
             continue
-        if max_quintets_per_tree is not None and len(usable) > max_quintets_per_tree:
-            idx = rng.choice(len(usable), size=max_quintets_per_tree, replace=False)
-            usable = [usable[int(i)] for i in sorted(idx)]
         m = 0
         for q in usable:
-            if canonicalize_quintet(gt, q) == canonicalize_quintet(st, q):
+            st_top = species_topology_cache.get(q)
+            if st_top is None:
+                st_top = canonicalize_quintet(st, q)
+                species_topology_cache[q] = st_top
+            if gene_topology_cache[(gid, q)] == st_top:
                 m += 1
         per_tree.append(float(m) / float(len(usable)))
     if not per_tree:
@@ -278,16 +338,6 @@ def infer_species_tree_newick_phase2(
     higher_order_weight: float = 1.0,
 ) -> str:
     """Infer species-tree topology Newick using current Phase 2 pipeline."""
-    observations = (
-        list(precomputed_observations)
-        if precomputed_observations is not None
-        else extract_quintet_observations_from_gene_trees(
-            gene_trees=gene_trees,
-            taxa=taxa,
-            max_quintets_per_tree=max_quintets_per_tree,
-            rng=rng,
-        )
-    )
     if taxa is None:
         all_taxa = sorted(get_shared_taxa(gene_trees))
     else:
@@ -296,6 +346,23 @@ def infer_species_tree_newick_phase2(
         raise ValueError("No taxa available for inference")
     if len(all_taxa) <= 3:
         return "(" + ",".join(all_taxa) + ");" if len(all_taxa) > 1 else all_taxa[0] + ";"
+
+    effective_max_quintets = max_quintets_per_tree
+    if baseline_guardrail and effective_max_quintets is not None and len(all_taxa) >= 24:
+        # Large taxa sets need a slightly larger construction sample budget for
+        # stable core candidate quality under guardrailed selection.
+        effective_max_quintets = max(int(effective_max_quintets), 180)
+
+    observations = (
+        list(precomputed_observations)
+        if precomputed_observations is not None
+        else extract_quintet_observations_from_gene_trees(
+            gene_trees=gene_trees,
+            taxa=all_taxa,
+            max_quintets_per_tree=effective_max_quintets,
+            rng=rng,
+        )
+    )
 
     if (
         precomputed_observations is None
@@ -336,14 +403,28 @@ def infer_species_tree_newick_phase2(
         ("upgma", _distance_baseline_newick(gene_trees, all_taxa, method="upgma")),
     ]
     rng_local = np.random.default_rng(20260219)
+    guardrail_score_max_quintets = max_quintets_per_tree
+    if guardrail_score_max_quintets is not None and len(all_taxa) >= 24:
+        # Slightly larger scoring sample stabilizes guardrail choice on larger
+        # taxa sets while remaining much faster than exhaustive enumeration.
+        guardrail_score_max_quintets = max(int(guardrail_score_max_quintets), 180)
+    sampled_subsets_by_gene = _prepare_guardrail_quintet_subsets(
+        gene_trees=gene_trees,
+        taxa=all_taxa,
+        max_quintets_per_tree=guardrail_score_max_quintets,
+        rng=rng_local,
+    )
+    gene_topology_cache = _prepare_guardrail_gene_topology_cache(
+        gene_trees=gene_trees,
+        sampled_subsets_by_gene=sampled_subsets_by_gene,
+    )
     scored = [
         (
-            _score_species_tree_newick(
-                gene_trees,
-                nwk,
-                all_taxa,
-                max_quintets_per_tree=max_quintets_per_tree,
-                rng=rng_local,
+            _score_species_tree_newick_cached(
+                gene_trees=gene_trees,
+                species_tree_newick=nwk,
+                sampled_subsets_by_gene=sampled_subsets_by_gene,
+                gene_topology_cache=gene_topology_cache,
             ),
             1 if name == "phase2" else 0,
             nwk,

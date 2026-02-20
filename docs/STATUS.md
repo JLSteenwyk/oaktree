@@ -109,6 +109,8 @@ Update this file when a milestone’s tests are green. Keep dates in YYYY-MM-DD.
       - `tables/validation_astral_core_vs_guardrail_confshrink2.json`
       - `tables/validation_astral_core_vs_guardrail_confshrink2_summary.md`
       - `tables/validation_astral_core_vs_guardrail_confshrink2_rf.png`
+    - Runtime profiling harness added:
+      - `scripts/profile_pipeline.py` (cProfile hotspot extraction for Phase 2/4 end-to-end runs)
 
 ## Current Suite
 - Latest targeted run: `./venv/bin/pytest -q tests/test_inference.py tests/test_weights.py tests/test_validation.py tests/test_cli.py` (26 passed)

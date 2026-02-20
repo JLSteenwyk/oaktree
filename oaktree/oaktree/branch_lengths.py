@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from itertools import combinations
 from typing import Iterable, Sequence
 
@@ -25,34 +26,33 @@ def _normalize_topology(obs_topology) -> tuple[tuple[str, str], tuple[str, str]]
     return (p1, p2)
 
 
-def _topology_to_index(topology) -> int:
-    # Map any labeled quintet topology to one of 15 label-invariant classes by
-    # ranking labels seen in pairs and assigning a synthetic singleton label.
-    p1, p2 = _normalize_topology(topology)
+_BASE_TOPOLOGIES: list[tuple[tuple[str, str], tuple[str, str]]] = sorted(
+    {
+        tuple(sorted((tuple(sorted(pair1)), tuple(sorted(pair2)))))
+        for pair1 in combinations(("a", "b", "c", "d", "e"), 2)
+        for pair2 in combinations(("a", "b", "c", "d", "e"), 2)
+        if pair1 < pair2 and set(pair1).isdisjoint(pair2)
+    }
+)
+
+
+@lru_cache(maxsize=1024)
+def _topology_to_index_cached(
+    normalized_topology: tuple[tuple[str, str], tuple[str, str]],
+) -> int:
+    # Map labels to a,b,c,d preserving relative sort order and assign
+    # singleton to e (consistent with previous implementation semantics).
+    p1, p2 = normalized_topology
     labels = sorted(set(p1) | set(p2))
-    # Include synthetic singleton to preserve the 5-taxon template mapping.
-    labels = labels + ["__SINGLETON__"]
     relabel = {x: chr(ord("a") + i) for i, x in enumerate(labels)}
     r1 = tuple(sorted((relabel[p1[0]], relabel[p1[1]])))
     r2 = tuple(sorted((relabel[p2[0]], relabel[p2[1]])))
     canonical = tuple(sorted((r1, r2)))
-    all_topologies = []
-    base = ["a", "b", "c", "d", "e"]
-    for i, pair1 in enumerate(combinations(base, 2)):
-        s1 = set(pair1)
-        for pair2 in combinations(base[i + 1 :], 2):
-            pass
-    # Enumerate 15 disjoint-pair topologies on a,b,c,d,e.
-    for pair1 in combinations(base, 2):
-        s1 = set(pair1)
-        for pair2 in combinations(base, 2):
-            s2 = set(pair2)
-            if pair1 >= pair2:
-                continue
-            if s1.isdisjoint(s2):
-                all_topologies.append(tuple(sorted((tuple(sorted(pair1)), tuple(sorted(pair2))))))
-    all_topologies = sorted(set(all_topologies))
-    return all_topologies.index(canonical)
+    return _BASE_TOPOLOGIES.index(canonical)
+
+
+def _topology_to_index(topology) -> int:
+    return _topology_to_index_cached(_normalize_topology(topology))
 
 
 def _leaf_sets_by_node(tree: treeswift.Tree) -> dict[treeswift.Node, set[str]]:
@@ -109,6 +109,19 @@ def count_quintet_frequencies(
     return counts
 
 
+def _estimate_branch_length_from_match_total(match: float, total: float) -> float:
+    """Fast equivalent of `estimate_branch_length` from max/total only."""
+    if total <= 0.0:
+        return 0.0
+    p = float(match) / float(total)
+    floor = 1.0 / 15.0
+    if p <= floor + 1e-15:
+        return 0.0
+    residual = max(1e-12, 1.0 - (p - floor) * (15.0 / 14.0))
+    tau = -float(np.log(residual))
+    return max(0.0, tau)
+
+
 def estimate_branch_length(
     observed_frequencies: np.ndarray,
 ) -> float:
@@ -139,18 +152,12 @@ def optimize_branch_lengths(
 ) -> treeswift.Tree:
     """Assign baseline internal branch lengths from edge-informative quintets."""
     optimized = _read_tree_from_newick(species_tree.newick())
-    leaf_sets = _leaf_sets_by_node(optimized)
-    all_taxa = {str(n.label) for n in optimized.traverse_leaves()}
-
-    for node in optimized.root.traverse_preorder():
-        if node is optimized.root or node.is_leaf():
-            continue
-        side_a = set(leaf_sets[node])
-        side_b = all_taxa - side_a
-        if not side_a or not side_b:
-            continue
-        freq = count_quintet_frequencies(optimized, side_a, quintet_observations)
-        tau = estimate_branch_length(freq)
+    nodes = _internal_nodes(optimized)
+    if not nodes:
+        return optimized
+    match, total = _edge_match_counts(optimized, quintet_observations)
+    for i, node in enumerate(nodes):
+        tau = _estimate_branch_length_from_match_total(float(match[i]), float(total[i]))
         node.edge_length = float(tau)
     return optimized
 
@@ -167,14 +174,28 @@ def _edge_match_counts(
     nodes = _internal_nodes(species_tree)
     match = np.zeros(len(nodes), dtype=float)
     total = np.zeros(len(nodes), dtype=float)
+    if not nodes:
+        return match, total
+
     leaf_sets = _leaf_sets_by_node(species_tree)
     all_taxa = {str(n.label) for n in species_tree.traverse_leaves()}
-    for i, node in enumerate(nodes):
-        side_a = set(leaf_sets[node])
-        side_b = all_taxa - side_a
-        freq = count_quintet_frequencies(species_tree, side_a, quintet_observations)
-        total[i] = float(np.sum(freq))
-        match[i] = float(np.max(freq)) if total[i] > 0 else 0.0
+    side_as = [set(leaf_sets[node]) for node in nodes]
+    side_bs = [all_taxa - side_a for side_a in side_as]
+    topo_counts = [{} for _ in nodes]
+
+    obs_rows = [
+        (set(obs.taxa), _normalize_topology(obs.topology), float(getattr(obs, "weight", 1.0)))
+        for obs in quintet_observations
+    ]
+    for q, topo, w in obs_rows:
+        for i, (side_a, side_b) in enumerate(zip(side_as, side_bs)):
+            if q.isdisjoint(side_a) or q.isdisjoint(side_b):
+                continue
+            total[i] += w
+            prev = float(topo_counts[i].get(topo, 0.0))
+            topo_counts[i][topo] = prev + w
+            if topo_counts[i][topo] > match[i]:
+                match[i] = topo_counts[i][topo]
     return match, total
 
 
@@ -225,10 +246,22 @@ def optimize_branch_lengths_ml(
         x = np.clip(np.asarray(x, dtype=float), 0.0, max_tau)
         return -branch_length_log_likelihood(x, match, total)
 
+    def objective_grad(x: np.ndarray) -> np.ndarray:
+        t = np.clip(np.asarray(x, dtype=float), 0.0, max_tau)
+        m = match
+        n = total
+        p_match = (1.0 / 15.0) + (14.0 / 15.0) * (1.0 - np.exp(-t))
+        p_match = np.clip(p_match, 1e-12, 1.0 - 1e-12)
+        one_minus = np.clip(1.0 - p_match, 1e-12, 1.0)
+        p_prime = (14.0 / 15.0) * np.exp(-t)
+        d_ll = p_prime * (m / p_match - (np.maximum(0.0, n - m) / one_minus))
+        return -d_ll
+
     res = minimize(
         objective,
         x0=init,
         method="L-BFGS-B",
+        jac=objective_grad,
         bounds=[(0.0, max_tau) for _ in range(len(nodes))],
     )
     x_opt = np.clip(np.asarray(res.x if res.success else init, dtype=float), 0.0, max_tau)

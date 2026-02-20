@@ -64,6 +64,15 @@ This file is the long-term memory for the project. It captures constraints, desi
   - grid 9x9: ~1.04s
   - grid 13x13: ~1.97s
   - grid 17x17: ~3.62s
+- 2026-02-20 end-to-end inference profiling harness added (`scripts/profile_pipeline.py`).
+  - Representative run: `shortbranch8`, Phase 4, 40 gene trees, 4 EM iterations, core mode.
+  - Timing: simulate ~0.021s, inference ~9.463s, total ~9.484s.
+  - Dominant cumulative hotspots:
+    - `weights.py:score_gene_tree_against_species_tree`
+    - `trees.py:extract_induced_subtree`
+    - `branch_lengths.py:optimize_branch_lengths_ml`
+    - `branch_lengths.py:count_quintet_frequencies`
+    - `msc.py:quintet_probability`
 - Guard-test budgets currently set to:
   - grid 9x9: < 4.0s
   - grid 13x13: < 7.0s
