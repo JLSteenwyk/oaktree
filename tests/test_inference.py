@@ -10,6 +10,7 @@ import treeswift
 
 from oaktree.graphs import partition_tree_to_newick
 from oaktree.inference import (
+    _compute_robust_gene_weights,
     extract_quintet_observations_from_gene_trees,
     extract_projected_quintet_observations_from_higher_order,
     infer_species_tree_newick_phase2,
@@ -346,3 +347,41 @@ def test_projected_higher_order_observations_smoke():
     )
     assert len(obs) > 0
     assert all(float(o.weight) > 0.0 for o in obs)
+
+
+def test_robust_gene_weights_downweight_low_coverage_outliers():
+    dem, taxa = _balanced_8_taxon_demography()
+    labels = {i: taxa[i] for i in range(8)}
+    genes = []
+    for ts in msprime.sim_ancestry(
+        samples={t: 1 for t in taxa},
+        demography=dem,
+        ploidy=1,
+        sequence_length=1,
+        recombination_rate=0,
+        num_replicates=16,
+        random_seed=91,
+    ):
+        genes.append(_read_tree(ts.first().as_newick(node_labels=labels)))
+    rng = np.random.default_rng(123)
+    mixed = []
+    for i, tr in enumerate(genes):
+        if i < 8:
+            mixed.append(tr)
+            continue
+        leaves = [str(n.label) for n in tr.traverse_leaves()]
+        drop = set(rng.choice(leaves, size=3, replace=False))
+        keep = set(leaves) - drop
+        pruned = tr.extract_tree_with(keep, suppress_unifurcations=True)
+        mixed.append(pruned)
+
+    w = _compute_robust_gene_weights(
+        mixed,
+        taxa=taxa,
+        max_quintets_per_tree=20,
+        rng=np.random.default_rng(7),
+    )
+    assert len(w) == len(mixed)
+    high_cov = float(np.mean(w[:8]))
+    low_cov = float(np.mean(w[8:]))
+    assert high_cov > low_cov

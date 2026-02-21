@@ -213,3 +213,65 @@ Artifacts:
 - `tables/validation_astral_core_vs_guardrail_confshrink2.json`
 - `tables/validation_astral_core_vs_guardrail_confshrink2_summary.md`
 - `tables/validation_astral_core_vs_guardrail_confshrink2_rf.png`
+
+## Large-Scale Benchmark (32 Taxa, 220 Genes, 2026-02-20)
+
+Artifact:
+- `tables/validation_balanced32_g220_fullset_r1.json`
+
+Summary (single-run RF/runtime):
+- Phase 2 core: RF `16`, runtime `19.72s`
+- Phase 2 guardrailed: RF `0`, runtime `84.88s`
+- Phase 4 core (i4): RF `16`, runtime `82.33s`
+- Phase 4 guardrailed (i4): RF `0`, runtime `194.38s`
+- NJ: RF `1`, runtime `1.86s`
+- UPGMA: RF `0`, runtime `1.91s`
+- ASTRAL: RF `1`, runtime `1.04s`
+
+Interpretation:
+- Guardrailed topology quality was strong (RF `0`) on this regime.
+- Runtime remained substantially above distance baselines and ASTRAL.
+
+## Large-Scale Optimization Checkpoint (32 Taxa, 220 Genes, 2026-02-20)
+
+Post-optimization artifact:
+- `tables/validation_balanced32_g220_guardrail_speed_postopt_sampling_exact_adaptive2.json`
+
+Summary:
+- Phase 2 core: RF `16`, runtime `3.70s`
+- Phase 2 guardrailed: RF `0`, runtime `26.28s`
+- Phase 4 guardrailed (i4): RF `1`, runtime `55.63s`
+
+Observed runtime improvement vs original fullset run:
+- Phase 2 guardrailed: `84.88s -> 26.28s` (~`3.23x` faster)
+- Phase 4 guardrailed (i4): `194.38s -> 55.63s` (~`3.49x` faster)
+
+## Guardrailed Seed Sweep + ASTRAL Reference (32 Taxa, 220 Genes, 2026-02-20)
+
+Artifacts:
+- `tables/validation_balanced32_g220_guardrail_seed_sweep_r3_topology_frozen_phase4.json`
+- `tables/validation_balanced32_g220_guardrail_vs_astral_r3.json`
+
+Three-seed aggregate summary:
+- OAKTREE Phase 2 guardrailed: mean RF `0.667`, mean runtime `26.39s`
+- OAKTREE Phase 4 guardrailed: mean RF `0.333`, mean runtime `39.30s`
+- ASTRAL: mean RF `1.000`, mean runtime `1.08s`
+
+Interpretation:
+- On this 3-seed sample, guardrailed Phase 4 improved RF over ASTRAL but remained much slower.
+
+## Large-Scale Benchmark (64 Taxa, 220 Genes, 2026-02-20)
+
+Artifact:
+- `tables/validation_balanced64_g220_fullset_r1.json`
+
+Summary (single-run RF/runtime):
+- Phase 2 guardrailed: RF `1`, runtime `51.45s`
+- Phase 4 guardrailed (i4): RF `1`, runtime `70.75s`
+- NJ: RF `1`, runtime `8.92s`
+- UPGMA: RF `0`, runtime `8.82s`
+- ASTRAL: RF `1`, runtime `2.23s`
+
+Interpretation:
+- Accuracy is competitive with ASTRAL/NJ on this run (all RF `1`) but not yet beyond UPGMA (RF `0`).
+- Runtime gap vs ASTRAL remains large at 64 taxa.

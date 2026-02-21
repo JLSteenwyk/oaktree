@@ -19,6 +19,7 @@ METHODS = [
     ("nj_rf", "NJ"),
     ("upgma_rf", "UPGMA"),
     ("astral_rf", "ASTRAL"),
+    ("tree_qmc_rf", "TREE-QMC"),
 ]
 
 

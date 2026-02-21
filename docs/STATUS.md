@@ -111,7 +111,30 @@ Update this file when a milestone’s tests are green. Keep dates in YYYY-MM-DD.
       - `tables/validation_astral_core_vs_guardrail_confshrink2_rf.png`
     - Runtime profiling harness added:
       - `scripts/profile_pipeline.py` (cProfile hotspot extraction for Phase 2/4 end-to-end runs)
+    - Large-scale benchmark artifacts added:
+      - `tables/validation_balanced32_g220_fullset_r1.json`
+      - `tables/validation_balanced32_g220_guardrail_speed_postopt.json`
+      - `tables/validation_balanced32_g220_guardrail_speed_postopt_sampling_exact_adaptive2.json`
+      - `tables/validation_balanced32_g220_guardrail_seed_sweep_r3_topology_frozen_phase4.json`
+      - `tables/validation_balanced32_g220_guardrail_vs_astral_r3.json`
+      - `tables/validation_balanced64_g220_fullset_r1.json`
+      - `tables/runtime_oaktree_vs_astral_postopt.json`
+      - `tables/speed_accuracy_oaktree_vs_astral.json`
+    - Large-scale quality snapshot:
+      - 32 taxa / 220 genes (`validation_balanced32_g220_fullset_r1.json`):
+        - Phase2 guardrailed RF `0`; Phase4 guardrailed (i4) RF `0`; ASTRAL RF `1`; UPGMA RF `0`; NJ RF `1`
+      - 64 taxa / 220 genes (`validation_balanced64_g220_fullset_r1.json`):
+        - Phase2 guardrailed RF `1`; Phase4 guardrailed (i4) RF `1`; ASTRAL RF `1`; UPGMA RF `0`; NJ RF `1`
+    - Large-scale runtime snapshot:
+      - 32 taxa / 220 genes post-opt exact sampling (`validation_balanced32_g220_guardrail_speed_postopt_sampling_exact_adaptive2.json`):
+        - Phase2 guardrailed `26.28s`; Phase4 guardrailed (i4) `55.63s`
+      - 64 taxa / 220 genes (`validation_balanced64_g220_fullset_r1.json`):
+        - Phase2 guardrailed `51.45s`; Phase4 guardrailed (i4) `70.75s`; ASTRAL `2.23s`
+    - Current optimization direction:
+      - Core Phase 2 remains the primary quality bottleneck on larger taxa regimes.
+      - Guardrailed path has acceptable quality on 32/64 taxa but remains significantly slower than ASTRAL.
 
 ## Current Suite
-- Latest targeted run: `./venv/bin/pytest -q tests/test_inference.py tests/test_weights.py tests/test_validation.py tests/test_cli.py` (26 passed)
+- Latest targeted run: `./venv/bin/pytest -q tests/test_inference.py tests/test_validation.py` (`18 passed, 1 failed`)
+- Failing test: `tests/test_inference.py::test_phase2_default_policy_matches_explicit_adaptive_noisy`
 - Date: 2026-02-20

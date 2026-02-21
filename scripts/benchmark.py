@@ -12,6 +12,7 @@ from oaktree.validation import (
     run_baseline_benchmark,
     run_expanded_benchmark,
     run_scaled16_quick_benchmark,
+    run_scaled64_complex_benchmark,
     summarize_rf_replicates,
 )
 
@@ -68,6 +69,17 @@ def main() -> int:
         help="Timeout for each ASTRAL invocation.",
     )
     parser.add_argument(
+        "--tree-qmc-bin",
+        default=None,
+        help="Optional TREE-QMC executable path (or command name if on PATH).",
+    )
+    parser.add_argument(
+        "--tree-qmc-timeout-seconds",
+        type=int,
+        default=180,
+        help="Timeout for each TREE-QMC invocation.",
+    )
+    parser.add_argument(
         "--higher-order-sizes",
         default="",
         help="Comma-separated higher-order subset sizes to inject (e.g. 6,7,8).",
@@ -96,6 +108,14 @@ def main() -> int:
         action="store_true",
         help="Run quick larger-size suite (16 taxa datasets).",
     )
+    parser.add_argument(
+        "--scaled64-complex",
+        action="store_true",
+        help=(
+            "Run 64-taxon complex suite "
+            "(balanced64, asymmetric64, shortbranch64, balanced64_missing, shortbranch64_missing_noisy)."
+        ),
+    )
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     args = parser.parse_args()
 
@@ -106,8 +126,9 @@ def main() -> int:
     replicate_runs = []
     for i in range(args.replicates):
         run_seed = args.seed + i * args.seed_step
-        if args.expanded and args.scaled16_quick:
-            raise ValueError("--expanded and --scaled16-quick are mutually exclusive")
+        mode_count = int(bool(args.expanded)) + int(bool(args.scaled16_quick)) + int(bool(args.scaled64_complex))
+        if mode_count > 1:
+            raise ValueError("--expanded, --scaled16-quick, and --scaled64-complex are mutually exclusive")
         modes = (
             [("guardrailed", True), ("core", False)]
             if args.guardrail_mode == "both"
@@ -115,7 +136,23 @@ def main() -> int:
         )
         merged_results = []
         for mode_name, use_guardrail in modes:
-            if args.scaled16_quick:
+            if args.scaled64_complex:
+                results = run_scaled64_complex_benchmark(
+                    n_gene_trees=args.n_gene_trees,
+                    seed=run_seed,
+                    low_signal_threshold=args.low_signal_threshold,
+                    low_signal_mode=args.low_signal_mode,
+                    baseline_guardrail=use_guardrail,
+                    higher_order_subset_sizes=higher_sizes,
+                    higher_order_subsets_per_tree=args.higher_order_subsets_per_tree,
+                    higher_order_quintets_per_subset=args.higher_order_quintets_per_subset,
+                    higher_order_weight=args.higher_order_weight,
+                    astral_jar_path=args.astral_jar,
+                    astral_timeout_seconds=args.astral_timeout_seconds,
+                    tree_qmc_bin=args.tree_qmc_bin,
+                    tree_qmc_timeout_seconds=args.tree_qmc_timeout_seconds,
+                )
+            elif args.scaled16_quick:
                 results = run_scaled16_quick_benchmark(
                     n_gene_trees=args.n_gene_trees,
                     seed=run_seed,
@@ -128,6 +165,8 @@ def main() -> int:
                     higher_order_weight=args.higher_order_weight,
                     astral_jar_path=args.astral_jar,
                     astral_timeout_seconds=args.astral_timeout_seconds,
+                    tree_qmc_bin=args.tree_qmc_bin,
+                    tree_qmc_timeout_seconds=args.tree_qmc_timeout_seconds,
                 )
             elif args.expanded:
                 results = run_expanded_benchmark(
@@ -142,6 +181,8 @@ def main() -> int:
                     higher_order_weight=args.higher_order_weight,
                     astral_jar_path=args.astral_jar,
                     astral_timeout_seconds=args.astral_timeout_seconds,
+                    tree_qmc_bin=args.tree_qmc_bin,
+                    tree_qmc_timeout_seconds=args.tree_qmc_timeout_seconds,
                 )
             else:
                 results = run_baseline_benchmark(
@@ -156,6 +197,8 @@ def main() -> int:
                     higher_order_weight=args.higher_order_weight,
                     astral_jar_path=args.astral_jar,
                     astral_timeout_seconds=args.astral_timeout_seconds,
+                    tree_qmc_bin=args.tree_qmc_bin,
+                    tree_qmc_timeout_seconds=args.tree_qmc_timeout_seconds,
                 )
             if len(modes) > 1:
                 results = [replace(r, dataset=f"{mode_name}:{r.dataset}") for r in results]
@@ -177,11 +220,14 @@ def main() -> int:
         "ci_bootstrap_samples": int(args.ci_bootstrap_samples),
         "expanded": bool(args.expanded),
         "scaled16_quick": bool(args.scaled16_quick),
+        "scaled64_complex": bool(args.scaled64_complex),
         "low_signal_threshold": float(args.low_signal_threshold),
         "low_signal_mode": str(args.low_signal_mode),
         "guardrail_mode": str(args.guardrail_mode),
         "astral_jar": args.astral_jar,
         "astral_timeout_seconds": int(args.astral_timeout_seconds),
+        "tree_qmc_bin": args.tree_qmc_bin,
+        "tree_qmc_timeout_seconds": int(args.tree_qmc_timeout_seconds),
         "higher_order_sizes": higher_sizes,
         "higher_order_subsets_per_tree": int(args.higher_order_subsets_per_tree),
         "higher_order_quintets_per_subset": int(args.higher_order_quintets_per_subset),

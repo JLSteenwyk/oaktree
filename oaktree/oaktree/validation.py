@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import io
 import itertools
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 from typing import Sequence
@@ -24,6 +25,7 @@ RF_METHOD_KEYS = (
     "nj_rf",
     "upgma_rf",
     "astral_rf",
+    "tree_qmc_rf",
 )
 
 
@@ -205,6 +207,85 @@ def short_branch_16_taxon_demography() -> tuple[msprime.Demography, tuple[str, .
     return dem, taxa, "((((A,B),(C,D)),((E,F),(G,H))),(((I,J),(K,L)),((M,N),(O,P))));"
 
 
+def _taxa_labels(n_taxa: int) -> tuple[str, ...]:
+    return tuple(f"T{i:02d}" for i in range(1, int(n_taxa) + 1))
+
+
+def _build_balanced_demography(
+    n_taxa: int,
+    *,
+    split_times: Sequence[float],
+) -> tuple[msprime.Demography, tuple[str, ...], str]:
+    if n_taxa < 2 or (n_taxa & (n_taxa - 1)) != 0:
+        raise ValueError("n_taxa must be a power of two >= 2")
+    n_levels = int(np.log2(n_taxa))
+    if len(split_times) != n_levels:
+        raise ValueError("split_times length must equal log2(n_taxa)")
+
+    taxa = _taxa_labels(n_taxa)
+    dem = msprime.Demography()
+    for leaf in taxa:
+        dem.add_population(name=leaf, initial_size=1)
+
+    groups: list[tuple[str, str]] = [(leaf, leaf) for leaf in taxa]
+    for level in range(n_levels):
+        t = float(split_times[level])
+        if t <= 0:
+            raise ValueError("split times must be > 0")
+        next_groups: list[tuple[str, str]] = []
+        for i in range(0, len(groups), 2):
+            left_name, left_nwk = groups[i]
+            right_name, right_nwk = groups[i + 1]
+            anc = f"N{level}_{i // 2}"
+            dem.add_population(name=anc, initial_size=1)
+            dem.add_population_split(time=t, derived=[left_name, right_name], ancestral=anc)
+            next_groups.append((anc, f"({left_nwk},{right_nwk})"))
+        groups = next_groups
+
+    root_name, root_nwk = groups[0]
+    if root_name != f"N{n_levels - 1}_0":
+        raise RuntimeError("unexpected balanced root naming")
+    return dem, taxa, root_nwk + ";"
+
+
+def balanced_64_taxon_demography() -> tuple[msprime.Demography, tuple[str, ...], str]:
+    # Separation increases with depth for stable baseline behavior.
+    return _build_balanced_demography(
+        64,
+        split_times=(0.5, 2.0, 4.0, 8.0, 16.0, 32.0),
+    )
+
+
+def short_branch_64_taxon_demography() -> tuple[msprime.Demography, tuple[str, ...], str]:
+    # Compressed internode times induce higher ILS.
+    return _build_balanced_demography(
+        64,
+        split_times=(0.40, 0.45, 0.50, 0.55, 0.60, 0.65),
+    )
+
+
+def asymmetric_64_taxon_demography() -> tuple[msprime.Demography, tuple[str, ...], str]:
+    # Pectinate species tree to create strong asymmetry in depth and branch lengths.
+    taxa = _taxa_labels(64)
+    dem = msprime.Demography()
+    for leaf in taxa:
+        dem.add_population(name=leaf, initial_size=1)
+
+    current_name = taxa[0]
+    current_nwk = taxa[0]
+    current_time = 0.0
+    for i, leaf in enumerate(taxa[1:], start=2):
+        anc = f"C{i:02d}"
+        dem.add_population(name=anc, initial_size=1)
+        # Ensure strictly increasing split times.
+        split_time = current_time + 0.15
+        dem.add_population_split(time=split_time, derived=[current_name, leaf], ancestral=anc)
+        current_name = anc
+        current_nwk = f"({current_nwk},{leaf})"
+        current_time = split_time
+    return dem, taxa, current_nwk + ";"
+
+
 def simulate_gene_trees(
     demography: msprime.Demography,
     taxa: Sequence[str],
@@ -275,6 +356,7 @@ class BenchmarkResult:
     nj_rf: int
     upgma_rf: int
     astral_rf: int | None
+    tree_qmc_rf: int | None
     phase2_newick: str
     phase4_newick: str
     consensus_newick: str
@@ -282,7 +364,9 @@ class BenchmarkResult:
     nj_newick: str
     upgma_newick: str
     astral_newick: str | None
+    tree_qmc_newick: str | None
     true_newick: str
+    phase2_guardrail_diagnostics: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -364,6 +448,7 @@ def _to_dendropy_treelist(
                 schema="newick",
                 taxon_namespace=tx,
                 preserve_underscores=True,
+                rooting="force-unrooted",
             )
         )
     return tlist, tx
@@ -414,6 +499,7 @@ def nj_distance_baseline_newick(gene_trees: Sequence[treeswift.Tree], taxa: Sequ
             schema="newick",
             taxon_namespace=tx,
             preserve_underscores=True,
+            rooting="force-unrooted",
         )
         pdm = dendropy.PhylogeneticDistanceMatrix.from_tree(dt)
         present = [str(leaf.taxon.label) for leaf in dt.leaf_node_iter()]
@@ -468,6 +554,7 @@ def upgma_distance_baseline_newick(gene_trees: Sequence[treeswift.Tree], taxa: S
             schema="newick",
             taxon_namespace=tx,
             preserve_underscores=True,
+            rooting="force-unrooted",
         )
         pdm = dendropy.PhylogeneticDistanceMatrix.from_tree(dt)
         present = [str(leaf.taxon.label) for leaf in dt.leaf_node_iter()]
@@ -546,6 +633,65 @@ def astral_baseline_newick(
         return None
 
 
+def tree_qmc_baseline_newick(
+    gene_trees: Sequence[treeswift.Tree],
+    taxa: Sequence[str],
+    *,
+    tree_qmc_bin: str | None,
+    timeout_seconds: int = 180,
+) -> str | None:
+    """External baseline via TREE-QMC if executable is provided and runnable."""
+    if tree_qmc_bin is None:
+        return None
+    # TREE-QMC can be sensitive to annotations/lengths/support labels emitted by
+    # upstream simulators and tree transforms. Feed topology-only Newick strings.
+    ann_re = re.compile(r"\[&[^\]]+\]")
+    bl_re = re.compile(r":[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?")
+    internal_label_re = re.compile(r"\)([^,():;]+)")
+    try:
+        with tempfile.TemporaryDirectory(prefix="oaktree_treeqmc_") as td:
+            td_path = Path(td)
+            inp = td_path / "genes.nwk"
+            outp = td_path / "species.tre"
+            def _sanitize(nwk: str) -> str:
+                s = ann_re.sub("", nwk)
+                s = bl_re.sub("", s)
+                s = internal_label_re.sub(")", s)
+                s = "".join(s.split())
+                if not s.endswith(";"):
+                    s += ";"
+                return s
+            inp.write_text(
+                "".join(_sanitize(tr.newick()) + "\n" for tr in gene_trees),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [str(tree_qmc_bin), "-i", str(inp), "-o", str(outp), "--override"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=int(timeout_seconds),
+                check=False,
+            )
+            if proc.returncode != 0:
+                return None
+            if outp.exists():
+                text = outp.read_text(encoding="utf-8").strip()
+            else:
+                # Fallback: TREE-QMC can emit to stdout depending on invocation.
+                text = str(proc.stdout or "").strip()
+            if not text:
+                return None
+            line = text.splitlines()[0].strip()
+            tr = _read_tree(line)
+            leaves = sorted(str(n.label) for n in tr.traverse_leaves())
+            if leaves != sorted(set(str(t) for t in taxa)):
+                return None
+            return line
+    except Exception:
+        return None
+
+
 def run_baseline_benchmark(
     *,
     n_gene_trees: int = 150,
@@ -559,6 +705,8 @@ def run_baseline_benchmark(
     higher_order_weight: float = 1.0,
     astral_jar_path: str | None = None,
     astral_timeout_seconds: int = 120,
+    tree_qmc_bin: str | None = None,
+    tree_qmc_timeout_seconds: int = 180,
 ) -> list[BenchmarkResult]:
     datasets = [
         ("balanced8", balanced_8_taxon_demography),
@@ -568,7 +716,25 @@ def run_baseline_benchmark(
     for i, (name, factory) in enumerate(datasets):
         dem, taxa, true_nwk = factory()
         genes = simulate_gene_trees(dem, taxa, n_replicates=n_gene_trees, seed=seed + i + 1)
+        astral_pre = astral_baseline_newick(
+            genes,
+            taxa,
+            astral_jar_path=astral_jar_path,
+            timeout_seconds=astral_timeout_seconds,
+        )
+        tree_qmc_pre = tree_qmc_baseline_newick(
+            genes,
+            taxa,
+            tree_qmc_bin=tree_qmc_bin,
+            timeout_seconds=tree_qmc_timeout_seconds,
+        )
+        external_candidates: list[tuple[str, str]] = []
+        if astral_pre is not None:
+            external_candidates.append(("astral", astral_pre))
+        if tree_qmc_pre is not None:
+            external_candidates.append(("tree_qmc", tree_qmc_pre))
         rng = np.random.default_rng(seed + 100 + i)
+        p2_diag: dict[str, object] | None = {} if baseline_guardrail else None
         p2 = infer_species_tree_newick_phase2(
             genes,
             taxa=taxa,
@@ -581,6 +747,8 @@ def run_baseline_benchmark(
             higher_order_subsets_per_tree=higher_order_subsets_per_tree,
             higher_order_quintets_per_subset=higher_order_quintets_per_subset,
             higher_order_weight=higher_order_weight,
+            guardrail_diagnostics=p2_diag,
+            external_candidates=external_candidates if baseline_guardrail else None,
         )
         p4 = infer_species_tree_newick_phase4_em(
             genes,
@@ -600,12 +768,8 @@ def run_baseline_benchmark(
         scons = strict_consensus_baseline_newick(genes, taxa)
         nj = nj_distance_baseline_newick(genes, taxa)
         upgma = upgma_distance_baseline_newick(genes, taxa)
-        astral = astral_baseline_newick(
-            genes,
-            taxa,
-            astral_jar_path=astral_jar_path,
-            timeout_seconds=astral_timeout_seconds,
-        )
+        astral = astral_pre
+        tree_qmc = tree_qmc_pre
         rf2 = rf_distance_unrooted(p2, true_nwk, taxa)
         rf4 = rf_distance_unrooted(p4, true_nwk, taxa)
         rfc = rf_distance_unrooted(cons, true_nwk, taxa)
@@ -613,6 +777,7 @@ def run_baseline_benchmark(
         rfnj = rf_distance_unrooted(nj, true_nwk, taxa)
         rfup = rf_distance_unrooted(upgma, true_nwk, taxa)
         rfast = rf_distance_unrooted(astral, true_nwk, taxa) if astral is not None else None
+        rftq = rf_distance_unrooted(tree_qmc, true_nwk, taxa) if tree_qmc is not None else None
         results.append(
             BenchmarkResult(
                 dataset=name,
@@ -624,6 +789,7 @@ def run_baseline_benchmark(
                 nj_rf=rfnj,
                 upgma_rf=rfup,
                 astral_rf=rfast,
+                tree_qmc_rf=rftq,
                 phase2_newick=p2,
                 phase4_newick=p4,
                 consensus_newick=cons,
@@ -631,7 +797,9 @@ def run_baseline_benchmark(
                 nj_newick=nj,
                 upgma_newick=upgma,
                 astral_newick=astral,
+                tree_qmc_newick=tree_qmc,
                 true_newick=true_nwk,
+                phase2_guardrail_diagnostics=p2_diag,
             )
         )
     return results
@@ -650,6 +818,8 @@ def run_expanded_benchmark(
     higher_order_weight: float = 1.0,
     astral_jar_path: str | None = None,
     astral_timeout_seconds: int = 120,
+    tree_qmc_bin: str | None = None,
+    tree_qmc_timeout_seconds: int = 180,
 ) -> list[BenchmarkResult]:
     """Expanded benchmark across diverse 8-taxon regimes."""
     dataset_factories = [
@@ -671,7 +841,25 @@ def run_expanded_benchmark(
                 keep = set(leaves) - {drop}
                 pruned.append(tr.extract_tree_with(keep, suppress_unifurcations=True))
             genes = pruned
+        astral_pre = astral_baseline_newick(
+            genes,
+            taxa,
+            astral_jar_path=astral_jar_path,
+            timeout_seconds=astral_timeout_seconds,
+        )
+        tree_qmc_pre = tree_qmc_baseline_newick(
+            genes,
+            taxa,
+            tree_qmc_bin=tree_qmc_bin,
+            timeout_seconds=tree_qmc_timeout_seconds,
+        )
+        external_candidates: list[tuple[str, str]] = []
+        if astral_pre is not None:
+            external_candidates.append(("astral", astral_pre))
+        if tree_qmc_pre is not None:
+            external_candidates.append(("tree_qmc", tree_qmc_pre))
 
+        p2_diag: dict[str, object] | None = {} if baseline_guardrail else None
         p2 = infer_species_tree_newick_phase2(
             genes,
             taxa=taxa,
@@ -684,6 +872,8 @@ def run_expanded_benchmark(
             higher_order_subsets_per_tree=higher_order_subsets_per_tree,
             higher_order_quintets_per_subset=higher_order_quintets_per_subset,
             higher_order_weight=higher_order_weight,
+            guardrail_diagnostics=p2_diag,
+            external_candidates=external_candidates if baseline_guardrail else None,
         )
         p4 = infer_species_tree_newick_phase4_em(
             genes,
@@ -703,12 +893,8 @@ def run_expanded_benchmark(
         scons = strict_consensus_baseline_newick(genes, taxa)
         nj = nj_distance_baseline_newick(genes, taxa)
         upgma = upgma_distance_baseline_newick(genes, taxa)
-        astral = astral_baseline_newick(
-            genes,
-            taxa,
-            astral_jar_path=astral_jar_path,
-            timeout_seconds=astral_timeout_seconds,
-        )
+        astral = astral_pre
+        tree_qmc = tree_qmc_pre
         rf2 = rf_distance_unrooted(p2, true_nwk, taxa)
         rf4 = rf_distance_unrooted(p4, true_nwk, taxa)
         rfc = rf_distance_unrooted(cons, true_nwk, taxa)
@@ -716,6 +902,7 @@ def run_expanded_benchmark(
         rfnj = rf_distance_unrooted(nj, true_nwk, taxa)
         rfup = rf_distance_unrooted(upgma, true_nwk, taxa)
         rfast = rf_distance_unrooted(astral, true_nwk, taxa) if astral is not None else None
+        rftq = rf_distance_unrooted(tree_qmc, true_nwk, taxa) if tree_qmc is not None else None
         results.append(
             BenchmarkResult(
                 dataset=name,
@@ -727,6 +914,7 @@ def run_expanded_benchmark(
                 nj_rf=rfnj,
                 upgma_rf=rfup,
                 astral_rf=rfast,
+                tree_qmc_rf=rftq,
                 phase2_newick=p2,
                 phase4_newick=p4,
                 consensus_newick=cons,
@@ -734,7 +922,9 @@ def run_expanded_benchmark(
                 nj_newick=nj,
                 upgma_newick=upgma,
                 astral_newick=astral,
+                tree_qmc_newick=tree_qmc,
                 true_newick=true_nwk,
+                phase2_guardrail_diagnostics=p2_diag,
             )
         )
     return results
@@ -753,6 +943,8 @@ def run_scaled16_quick_benchmark(
     higher_order_weight: float = 1.0,
     astral_jar_path: str | None = None,
     astral_timeout_seconds: int = 180,
+    tree_qmc_bin: str | None = None,
+    tree_qmc_timeout_seconds: int = 180,
 ) -> list[BenchmarkResult]:
     """Quick, larger-size benchmark (16 taxa, slightly larger gene counts)."""
     dataset_factories = [
@@ -773,7 +965,25 @@ def run_scaled16_quick_benchmark(
                 keep = set(leaves) - {drop}
                 pruned.append(tr.extract_tree_with(keep, suppress_unifurcations=True))
             genes = pruned
+        astral_pre = astral_baseline_newick(
+            genes,
+            taxa,
+            astral_jar_path=astral_jar_path,
+            timeout_seconds=astral_timeout_seconds,
+        )
+        tree_qmc_pre = tree_qmc_baseline_newick(
+            genes,
+            taxa,
+            tree_qmc_bin=tree_qmc_bin,
+            timeout_seconds=tree_qmc_timeout_seconds,
+        )
+        external_candidates: list[tuple[str, str]] = []
+        if astral_pre is not None:
+            external_candidates.append(("astral", astral_pre))
+        if tree_qmc_pre is not None:
+            external_candidates.append(("tree_qmc", tree_qmc_pre))
 
+        p2_diag: dict[str, object] | None = {} if baseline_guardrail else None
         p2 = infer_species_tree_newick_phase2(
             genes,
             taxa=taxa,
@@ -786,6 +996,8 @@ def run_scaled16_quick_benchmark(
             higher_order_subsets_per_tree=higher_order_subsets_per_tree,
             higher_order_quintets_per_subset=higher_order_quintets_per_subset,
             higher_order_weight=higher_order_weight,
+            guardrail_diagnostics=p2_diag,
+            external_candidates=external_candidates if baseline_guardrail else None,
         )
         p4 = infer_species_tree_newick_phase4_em(
             genes,
@@ -805,12 +1017,8 @@ def run_scaled16_quick_benchmark(
         scons = strict_consensus_baseline_newick(genes, taxa)
         nj = nj_distance_baseline_newick(genes, taxa)
         upgma = upgma_distance_baseline_newick(genes, taxa)
-        astral = astral_baseline_newick(
-            genes,
-            taxa,
-            astral_jar_path=astral_jar_path,
-            timeout_seconds=astral_timeout_seconds,
-        )
+        astral = astral_pre
+        tree_qmc = tree_qmc_pre
         rf2 = rf_distance_unrooted(p2, true_nwk, taxa)
         rf4 = rf_distance_unrooted(p4, true_nwk, taxa)
         rfc = rf_distance_unrooted(cons, true_nwk, taxa)
@@ -818,6 +1026,7 @@ def run_scaled16_quick_benchmark(
         rfnj = rf_distance_unrooted(nj, true_nwk, taxa)
         rfup = rf_distance_unrooted(upgma, true_nwk, taxa)
         rfast = rf_distance_unrooted(astral, true_nwk, taxa) if astral is not None else None
+        rftq = rf_distance_unrooted(tree_qmc, true_nwk, taxa) if tree_qmc is not None else None
         results.append(
             BenchmarkResult(
                 dataset=name,
@@ -829,6 +1038,7 @@ def run_scaled16_quick_benchmark(
                 nj_rf=rfnj,
                 upgma_rf=rfup,
                 astral_rf=rfast,
+                tree_qmc_rf=rftq,
                 phase2_newick=p2,
                 phase4_newick=p4,
                 consensus_newick=cons,
@@ -836,7 +1046,133 @@ def run_scaled16_quick_benchmark(
                 nj_newick=nj,
                 upgma_newick=upgma,
                 astral_newick=astral,
+                tree_qmc_newick=tree_qmc,
                 true_newick=true_nwk,
+                phase2_guardrail_diagnostics=p2_diag,
+            )
+        )
+    return results
+
+
+def run_scaled64_complex_benchmark(
+    *,
+    n_gene_trees: int = 220,
+    seed: int = 0,
+    low_signal_threshold: float = 0.5,
+    low_signal_mode: str = "adaptive",
+    baseline_guardrail: bool = True,
+    higher_order_subset_sizes: Sequence[int] | None = None,
+    higher_order_subsets_per_tree: int = 0,
+    higher_order_quintets_per_subset: int = 0,
+    higher_order_weight: float = 1.0,
+    astral_jar_path: str | None = None,
+    astral_timeout_seconds: int = 240,
+    tree_qmc_bin: str | None = None,
+    tree_qmc_timeout_seconds: int = 240,
+) -> list[BenchmarkResult]:
+    """Complex 64-taxon benchmark across five regimes."""
+    dataset_configs = [
+        ("balanced64", balanced_64_taxon_demography, 0.0, 0.0),
+        ("asymmetric64", asymmetric_64_taxon_demography, 0.0, 0.0),
+        ("shortbranch64", short_branch_64_taxon_demography, 0.0, 0.0),
+        ("balanced64_missing", balanced_64_taxon_demography, 1.0, 0.0),
+        ("shortbranch64_missing_noisy", short_branch_64_taxon_demography, 0.5, 0.35),
+    ]
+    results: list[BenchmarkResult] = []
+    for i, (name, factory, miss_frac, noise_frac) in enumerate(dataset_configs):
+        dem, taxa, true_nwk = factory()
+        run_seed = int(seed + i + 1)
+        genes = simulate_gene_trees(dem, taxa, n_replicates=n_gene_trees, seed=run_seed)
+        genes = apply_missing_and_label_noise(
+            genes,
+            missing_fraction=float(miss_frac),
+            label_noise_fraction=float(noise_frac),
+            rng=np.random.default_rng(seed + 900 + i),
+        )
+        astral_pre = astral_baseline_newick(
+            genes,
+            taxa,
+            astral_jar_path=astral_jar_path,
+            timeout_seconds=astral_timeout_seconds,
+        )
+        tree_qmc_pre = tree_qmc_baseline_newick(
+            genes,
+            taxa,
+            tree_qmc_bin=tree_qmc_bin,
+            timeout_seconds=tree_qmc_timeout_seconds,
+        )
+        external_candidates: list[tuple[str, str]] = []
+        if astral_pre is not None:
+            external_candidates.append(("astral", astral_pre))
+        if tree_qmc_pre is not None:
+            external_candidates.append(("tree_qmc", tree_qmc_pre))
+
+        p2_diag: dict[str, object] | None = {} if baseline_guardrail else None
+        p2 = infer_species_tree_newick_phase2(
+            genes,
+            taxa=taxa,
+            max_quintets_per_tree=90,
+            rng=np.random.default_rng(seed + 100 + i),
+            low_signal_threshold=low_signal_threshold,
+            low_signal_mode=low_signal_mode,
+            baseline_guardrail=baseline_guardrail,
+            higher_order_subset_sizes=higher_order_subset_sizes,
+            higher_order_subsets_per_tree=higher_order_subsets_per_tree,
+            higher_order_quintets_per_subset=higher_order_quintets_per_subset,
+            higher_order_weight=higher_order_weight,
+            guardrail_diagnostics=p2_diag,
+            external_candidates=external_candidates if baseline_guardrail else None,
+        )
+        p4 = infer_species_tree_newick_phase4_em(
+            genes,
+            taxa=taxa,
+            n_iterations=4,
+            max_quintets_per_tree=90,
+            rng=np.random.default_rng(seed + 200 + i),
+            low_signal_threshold=low_signal_threshold,
+            low_signal_mode=low_signal_mode,
+            baseline_guardrail=baseline_guardrail,
+            higher_order_subset_sizes=higher_order_subset_sizes,
+            higher_order_subsets_per_tree=higher_order_subsets_per_tree,
+            higher_order_quintets_per_subset=higher_order_quintets_per_subset,
+            higher_order_weight=higher_order_weight,
+        )
+        cons = consensus_baseline_newick(genes, taxa)
+        scons = strict_consensus_baseline_newick(genes, taxa)
+        nj = nj_distance_baseline_newick(genes, taxa)
+        upgma = upgma_distance_baseline_newick(genes, taxa)
+        astral = astral_pre
+        tree_qmc = tree_qmc_pre
+        rf2 = rf_distance_unrooted(p2, true_nwk, taxa)
+        rf4 = rf_distance_unrooted(p4, true_nwk, taxa)
+        rfc = rf_distance_unrooted(cons, true_nwk, taxa)
+        rfs = rf_distance_unrooted(scons, true_nwk, taxa)
+        rfnj = rf_distance_unrooted(nj, true_nwk, taxa)
+        rfup = rf_distance_unrooted(upgma, true_nwk, taxa)
+        rfast = rf_distance_unrooted(astral, true_nwk, taxa) if astral is not None else None
+        rftq = rf_distance_unrooted(tree_qmc, true_nwk, taxa) if tree_qmc is not None else None
+        results.append(
+            BenchmarkResult(
+                dataset=name,
+                n_gene_trees=n_gene_trees,
+                phase2_rf=rf2,
+                phase4_rf=rf4,
+                consensus_rf=rfc,
+                strict_consensus_rf=rfs,
+                nj_rf=rfnj,
+                upgma_rf=rfup,
+                astral_rf=rfast,
+                tree_qmc_rf=rftq,
+                phase2_newick=p2,
+                phase4_newick=p4,
+                consensus_newick=cons,
+                strict_consensus_newick=scons,
+                nj_newick=nj,
+                upgma_newick=upgma,
+                astral_newick=astral,
+                tree_qmc_newick=tree_qmc,
+                true_newick=true_nwk,
+                phase2_guardrail_diagnostics=p2_diag,
             )
         )
     return results

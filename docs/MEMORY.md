@@ -58,6 +58,11 @@ This file is the long-term memory for the project. It captures constraints, desi
 - 2026-02-19: M3 (Branch Lengths), M4 (EM Loop), and M5 (CLI) completed with passing tests.
 - 2026-02-19: Phase 2 includes low-signal unresolved split handling and Newick polytomy emission for unresolved leaves.
 - 2026-02-19: Phase 6 expanded benchmark artifact generated at `tables/validation_expanded.json`.
+- 2026-02-20: Added large-taxa optimization and stabilization changes in Phase 2/4 paths:
+  - exact uniform quintet subset sampling via combinatorial unranking
+  - guardrailed large-taxa budget floors in candidate construction/scoring
+  - Phase 4 large-taxa topology-freeze behavior (branch-length optimization without topology moves)
+  - topology-change acceptance gating for large-taxa guardrailed EM proposals
 
 ## Profiling baselines
 - 2026-02-19 lookup precompute baseline (`scripts/profile_lookup_tables.py`, max_tau=2.0, all 15 species topologies):
@@ -77,9 +82,18 @@ This file is the long-term memory for the project. It captures constraints, desi
   - grid 9x9: < 4.0s
   - grid 13x13: < 7.0s
   - grid 17x17: < 12.0s
+- 2026-02-20 larger-scale runtime checkpoints:
+  - 32 taxa / 220 genes fullset (`tables/validation_balanced32_g220_fullset_r1.json`):
+    - phase2_guardrailed ~84.88s; phase4_guardrailed_i4 ~194.38s
+  - 32 taxa / 220 genes post-opt exact sampling (`tables/validation_balanced32_g220_guardrail_speed_postopt_sampling_exact_adaptive2.json`):
+    - phase2_guardrailed ~26.28s; phase4_guardrailed_i4 ~55.63s
+  - 64 taxa / 220 genes fullset (`tables/validation_balanced64_g220_fullset_r1.json`):
+    - phase2_guardrailed ~51.45s; phase4_guardrailed_i4 ~70.75s; astral ~2.23s
 
 ## Current validation snapshot
-- 2026-02-19 full suite: `./venv/bin/pytest -q` -> 64 passed.
+- 2026-02-20 targeted suite: `./venv/bin/pytest -q tests/test_inference.py tests/test_validation.py` -> 18 passed, 1 failed.
+- Current failing test:
+  - `tests/test_inference.py::test_phase2_default_policy_matches_explicit_adaptive_noisy`
 - 2026-02-19 validation artifacts:
   - `tables/validation_expanded.json`
   - `tables/validation_expanded_summary.md`
@@ -98,3 +112,12 @@ This file is the long-term memory for the project. It captures constraints, desi
   - `tables/validation_recommended.json`
   - `tables/validation_recommended_summary.md`
   - `tables/validation_recommended_rf.png`
+  - `tables/validation_balanced32_g220_fullset_r1.json`
+  - `tables/validation_balanced32_g220_guardrail_speed_postopt.json`
+  - `tables/validation_balanced32_g220_guardrail_speed_postopt_sampling_exact_adaptive2.json`
+  - `tables/validation_balanced32_g220_guardrail_seed_sweep_r3.json`
+  - `tables/validation_balanced32_g220_guardrail_seed_sweep_r3_topology_frozen_phase4.json`
+  - `tables/validation_balanced32_g220_guardrail_vs_astral_r3.json`
+  - `tables/validation_balanced64_g220_fullset_r1.json`
+  - `tables/runtime_oaktree_vs_astral_postopt.json`
+  - `tables/speed_accuracy_oaktree_vs_astral.json`

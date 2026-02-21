@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from itertools import combinations
+from math import log
+import time
 from typing import Sequence
 
 import numpy as np
 import treeswift
 
+from .branch_lengths import optimize_branch_lengths_ml
 from .graphs import partition_tree_to_newick, recursive_partition
+from .msc import _quintet_probabilities_for_newick
 from .trees import (
     QuintetObservation,
     canonicalize_quintet,
+    extract_induced_subtree,
     get_leaf_set,
     get_shared_taxa,
     sample_quintet_subsets,
@@ -191,6 +196,7 @@ def _score_species_tree_newick(
         species_tree_newick=species_tree_newick,
         sampled_subsets_by_gene=sampled_subsets_by_gene,
         gene_topology_cache=gene_topology_cache,
+        gene_weights_by_id=None,
     )
 
 
@@ -230,18 +236,121 @@ def _prepare_guardrail_gene_topology_cache(
     return cache
 
 
+def _compute_robust_gene_weights(
+    gene_trees: Sequence[treeswift.Tree],
+    taxa: Sequence[str],
+    *,
+    max_quintets_per_tree: int | None,
+    rng: np.random.Generator,
+) -> list[float]:
+    """Coverage-aware + outlier-robust per-gene weights for quintet extraction."""
+    taxa_use = sorted(set(str(t) for t in taxa))
+    n_taxa = len(taxa_use)
+    if n_taxa < 5 or not gene_trees:
+        return [1.0 for _ in gene_trees]
+
+    coverage_weight: list[float] = []
+    sampled_subsets_by_gene: dict[int, list[tuple[str, str, str, str, str]]] = {}
+    gene_topology_cache: dict[tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]] = {}
+
+    for gt in gene_trees:
+        present = [t for t in taxa_use if t in get_leaf_set(gt)]
+        frac = float(len(present)) / float(n_taxa)
+        # Strongly penalize low-coverage genes in missing-data regimes.
+        coverage_weight.append(float(max(frac * frac, 0.0)))
+        if len(present) < 5:
+            sampled_subsets_by_gene[id(gt)] = []
+            continue
+        subsets = sample_quintet_subsets(
+            present,
+            max_quintets=max_quintets_per_tree,
+            rng=rng,
+        )
+        sampled_subsets_by_gene[id(gt)] = subsets
+        for q in subsets:
+            gene_topology_cache[(id(gt), q)] = canonicalize_quintet(gt, q)
+
+    # Build aggregate quintet signal with coverage-aware votes.
+    vote_by_quintet: dict[
+        tuple[str, str, str, str, str],
+        dict[tuple[tuple[str, str], tuple[str, str]], float],
+    ] = {}
+    for i, gt in enumerate(gene_trees):
+        w = float(coverage_weight[i])
+        if w <= 0.0:
+            continue
+        for q in sampled_subsets_by_gene.get(id(gt), []):
+            topo = gene_topology_cache[(id(gt), q)]
+            d = vote_by_quintet.setdefault(q, {})
+            d[topo] = d.get(topo, 0.0) + w
+
+    best_topology: dict[tuple[str, str, str, str, str], tuple[tuple[str, str], tuple[str, str]]] = {}
+    confidence_by_quintet: dict[tuple[str, str, str, str, str], float] = {}
+    for q, d in vote_by_quintet.items():
+        if not d:
+            continue
+        ranked = sorted(d.items(), key=lambda kv: kv[1], reverse=True)
+        top1_topo, top1 = ranked[0]
+        top2 = ranked[1][1] if len(ranked) > 1 else 0.0
+        total = float(sum(d.values()))
+        conf = max(0.0, (float(top1) - float(top2)) / total) if total > 0.0 else 0.0
+        best_topology[q] = top1_topo
+        confidence_by_quintet[q] = conf
+
+    agreement: list[float] = []
+    for gt in gene_trees:
+        usable = sampled_subsets_by_gene.get(id(gt), [])
+        if not usable:
+            agreement.append(0.0)
+            continue
+        m = 0.0
+        z = 0.0
+        for q in usable:
+            conf = max(float(confidence_by_quintet.get(q, 0.0)), 1e-6)
+            z += conf
+            if gene_topology_cache[(id(gt), q)] == best_topology.get(q):
+                m += conf
+        agreement.append(float(m / z) if z > 0.0 else 0.0)
+
+    raw = np.array(
+        [
+            float(coverage_weight[i]) * (0.20 + 0.80 * float(agreement[i]))
+            for i in range(len(gene_trees))
+        ],
+        dtype=float,
+    )
+    mean_coverage = float(np.mean(coverage_weight)) if coverage_weight else 1.0
+    median_agreement = float(np.median(agreement)) if agreement else 1.0
+    apply_trim = bool(mean_coverage < 0.95 or median_agreement < 0.60)
+    valid = raw > 0.0
+    if apply_trim and int(np.count_nonzero(valid)) >= 12:
+        cutoff = float(np.quantile(raw[valid], 0.20))
+        # Keep outliers but suppress their impact instead of hard dropping.
+        raw = np.where(raw < cutoff, raw * 0.20, raw)
+    valid = raw > 0.0
+    if int(np.count_nonzero(valid)) == 0:
+        return [1.0 for _ in gene_trees]
+    raw = raw / float(np.mean(raw[valid]))
+    return [float(w) for w in raw]
+
+
 def _score_species_tree_newick_cached(
     gene_trees: Sequence[treeswift.Tree],
     species_tree_newick: str,
     *,
     sampled_subsets_by_gene: dict[int, list[tuple[str, str, str, str, str]]],
     gene_topology_cache: dict[tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]],
+    gene_weights_by_id: dict[int, float] | None = None,
 ) -> float:
     st = _read_tree(species_tree_newick)
     species_topology_cache: dict[tuple[str, str, str, str, str], tuple[tuple[str, str], tuple[str, str]]] = {}
-    per_tree = []
+    per_tree_scores: list[float] = []
+    per_tree_weights: list[float] = []
     for gt in gene_trees:
         gid = id(gt)
+        gene_w = float(gene_weights_by_id.get(gid, 1.0)) if gene_weights_by_id is not None else 1.0
+        if gene_w <= 0.0:
+            continue
         usable = sampled_subsets_by_gene.get(gid, [])
         if not usable:
             continue
@@ -253,10 +362,66 @@ def _score_species_tree_newick_cached(
                 species_topology_cache[q] = st_top
             if gene_topology_cache[(gid, q)] == st_top:
                 m += 1
-        per_tree.append(float(m) / float(len(usable)))
-    if not per_tree:
+        per_tree_scores.append(float(m) / float(len(usable)))
+        per_tree_weights.append(gene_w)
+    if not per_tree_scores:
         return 0.0
-    return float(np.mean(per_tree))
+    return float(np.average(np.asarray(per_tree_scores, dtype=float), weights=np.asarray(per_tree_weights, dtype=float)))
+
+
+def _score_species_tree_newick_msc_cached(
+    gene_trees: Sequence[treeswift.Tree],
+    species_tree_newick: str,
+    *,
+    sampled_subsets_by_gene: dict[int, list[tuple[str, str, str, str, str]]],
+    gene_topology_cache: dict[tuple[int, tuple[str, str, str, str, str]], tuple[tuple[str, str], tuple[str, str]]],
+    gene_weights_by_id: dict[int, float] | None = None,
+) -> float:
+    """Mean per-gene MSC log-likelihood score on sampled quintets."""
+    st = _read_tree(species_tree_newick)
+    has_branch_lengths = any(
+        (node is not st.root) and (not node.is_leaf()) and (float(node.edge_length or 0.0) > 0.0)
+        for node in st.root.traverse_preorder()
+    )
+    if not has_branch_lengths:
+        return _score_species_tree_newick_cached(
+            gene_trees=gene_trees,
+            species_tree_newick=species_tree_newick,
+            sampled_subsets_by_gene=sampled_subsets_by_gene,
+            gene_topology_cache=gene_topology_cache,
+            gene_weights_by_id=gene_weights_by_id,
+        )
+
+    species_prob_cache: dict[
+        tuple[str, str, str, str, str], dict[tuple[tuple[str, str], tuple[str, str]], float]
+    ] = {}
+    per_tree_scores: list[float] = []
+    per_tree_weights: list[float] = []
+    for gt in gene_trees:
+        gid = id(gt)
+        gene_w = float(gene_weights_by_id.get(gid, 1.0)) if gene_weights_by_id is not None else 1.0
+        if gene_w <= 0.0:
+            continue
+        usable = sampled_subsets_by_gene.get(gid, [])
+        if not usable:
+            continue
+        total = 0.0
+        for q in usable:
+            probs = species_prob_cache.get(q)
+            if probs is None:
+                induced = extract_induced_subtree(st, q)
+                induced.resolve_polytomies()
+                induced.suppress_unifurcations()
+                probs = _quintet_probabilities_for_newick(induced.newick())
+                species_prob_cache[q] = probs
+            gt_top = gene_topology_cache[(gid, q)]
+            p = max(float(probs.get(tuple(sorted(gt_top)), 0.0)), 1e-12)
+            total += log(p)
+        per_tree_scores.append(total / float(len(usable)))
+        per_tree_weights.append(gene_w)
+    if not per_tree_scores:
+        return -float("inf")
+    return float(np.average(np.asarray(per_tree_scores, dtype=float), weights=np.asarray(per_tree_weights, dtype=float)))
 
 
 def _distance_baseline_newick(
@@ -320,6 +485,33 @@ def _distance_baseline_newick(
     return tree.as_string(schema="newick").strip()
 
 
+def _consensus_baseline_newick(
+    gene_trees: Sequence[treeswift.Tree],
+    taxa: Sequence[str],
+) -> str:
+    """Majority-rule consensus baseline candidate."""
+    try:
+        import dendropy
+    except Exception:
+        return "(" + ",".join(sorted(set(taxa))) + ");"
+    tx = dendropy.TaxonNamespace(list(sorted(set(str(t) for t in taxa))))
+    tlist = dendropy.TreeList(taxon_namespace=tx)
+    for tr in gene_trees:
+        tlist.append(
+            dendropy.Tree.get(
+                data=tr.newick(),
+                schema="newick",
+                taxon_namespace=tx,
+                preserve_underscores=True,
+                rooting="force-unrooted",
+            )
+        )
+    cons = tlist.consensus(min_freq=0.5)
+    cons.is_rooted = False
+    cons.suppress_unifurcations()
+    return cons.as_string(schema="newick").strip()
+
+
 def infer_species_tree_newick_phase2(
     gene_trees: Sequence[treeswift.Tree],
     taxa: Sequence[str] | None = None,
@@ -336,6 +528,8 @@ def infer_species_tree_newick_phase2(
     higher_order_subsets_per_tree: int = 0,
     higher_order_quintets_per_subset: int = 0,
     higher_order_weight: float = 1.0,
+    guardrail_diagnostics: dict[str, object] | None = None,
+    external_candidates: Sequence[tuple[str, str]] | None = None,
 ) -> str:
     """Infer species-tree topology Newick using current Phase 2 pipeline."""
     if taxa is None:
@@ -353,6 +547,17 @@ def infer_species_tree_newick_phase2(
         # stable core candidate quality under guardrailed selection.
         effective_max_quintets = max(int(effective_max_quintets), 180)
 
+    robust_gene_weights = (
+        _compute_robust_gene_weights(
+            gene_trees=gene_trees,
+            taxa=all_taxa,
+            max_quintets_per_tree=effective_max_quintets,
+            rng=np.random.default_rng(20260221),
+        )
+        if precomputed_observations is None and len(all_taxa) >= 24
+        else None
+    )
+
     observations = (
         list(precomputed_observations)
         if precomputed_observations is not None
@@ -361,6 +566,7 @@ def infer_species_tree_newick_phase2(
             taxa=all_taxa,
             max_quintets_per_tree=effective_max_quintets,
             rng=rng,
+            gene_weights=robust_gene_weights,
         )
     )
 
@@ -383,7 +589,18 @@ def infer_species_tree_newick_phase2(
         )
 
     if confidence_shrink:
-        observations = shrink_quintet_observations_by_confidence(observations)
+        min_conf = 0.0
+        high_conf = 0.55
+        if len(all_taxa) >= 24 and not baseline_guardrail:
+            # Large-taxa standalone runs are sensitive to noisy/missing gene
+            # trees; tighten confidence filtering to suppress ambiguous quintets.
+            min_conf = 0.03
+            high_conf = 0.80
+        observations = shrink_quintet_observations_by_confidence(
+            observations,
+            min_confidence=min_conf,
+            high_confidence_passthrough=high_conf,
+        )
 
     partition_tree, _ = recursive_partition(
         taxa=all_taxa,
@@ -394,14 +611,89 @@ def infer_species_tree_newick_phase2(
         low_signal_mode=low_signal_mode,
     )
     p2_newick = partition_tree_to_newick(partition_tree)
-    if not baseline_guardrail:
-        return p2_newick
 
-    candidates = [
-        ("phase2", p2_newick),
-        ("nj", _distance_baseline_newick(gene_trees, all_taxa, method="nj")),
-        ("upgma", _distance_baseline_newick(gene_trees, all_taxa, method="upgma")),
-    ]
+    candidates: list[dict[str, object]] = []
+    seen_newicks: set[str] = set()
+
+    def _append_candidate(name: str, newick: str, generation_runtime_s: float) -> None:
+        nwk = str(newick)
+        if nwk in seen_newicks:
+            return
+        seen_newicks.add(nwk)
+        candidates.append({"name": str(name), "newick": nwk, "generation_runtime_s": float(generation_runtime_s)})
+
+    _append_candidate("phase2", p2_newick, 0.0)
+    t0 = time.perf_counter()
+    _append_candidate(
+        "nj",
+        _distance_baseline_newick(gene_trees, all_taxa, method="nj"),
+        float(time.perf_counter() - t0),
+    )
+    t0 = time.perf_counter()
+    _append_candidate(
+        "upgma",
+        _distance_baseline_newick(gene_trees, all_taxa, method="upgma"),
+        float(time.perf_counter() - t0),
+    )
+    if len(all_taxa) >= 24 and observations:
+        # Candidate bank for standalone robustness: sweep Phase2 split policy
+        # settings on the same quintet observations.
+        phase2_variants = (
+            ("phase2_lsig025", True, 0.25, "adaptive"),
+            ("phase2_lsig035", True, 0.35, "adaptive"),
+            ("phase2_lsig065", True, 0.65, "adaptive"),
+            ("phase2_no_norm_lsig050", False, 0.50, "adaptive"),
+            ("phase2_no_norm_lsig035", False, 0.35, "adaptive"),
+        )
+        for name, n2_norm, lsig_thr, lsig_mode in phase2_variants:
+            t0 = time.perf_counter()
+            part_var, _ = recursive_partition(
+                taxa=all_taxa,
+                quintet_observations=observations,
+                species_tree_estimate=None,
+                n2_normalization=n2_norm,
+                low_signal_threshold=lsig_thr,
+                low_signal_mode=lsig_mode,
+            )
+            _append_candidate(name, partition_tree_to_newick(part_var), float(time.perf_counter() - t0))
+    if len(all_taxa) >= 24:
+        # Multi-resolution candidate: larger quintet sample may stabilize hard regimes.
+        if max_quintets_per_tree is not None:
+            hi_budget = max(int(max_quintets_per_tree) * 2, 360)
+            t0 = time.perf_counter()
+            obs_hi = extract_quintet_observations_from_gene_trees(
+                gene_trees=gene_trees,
+                taxa=all_taxa,
+                max_quintets_per_tree=hi_budget,
+                rng=np.random.default_rng(20260220),
+            )
+            if confidence_shrink:
+                obs_hi = shrink_quintet_observations_by_confidence(obs_hi)
+            part_hi, _ = recursive_partition(
+                taxa=all_taxa,
+                quintet_observations=obs_hi,
+                species_tree_estimate=None,
+                n2_normalization=n2_normalization,
+                low_signal_threshold=low_signal_threshold,
+                low_signal_mode=low_signal_mode,
+            )
+            _append_candidate(
+                f"phase2_hires_q{hi_budget}",
+                partition_tree_to_newick(part_hi),
+                float(time.perf_counter() - t0),
+            )
+        # Consensus-informed candidate often helps asymmetric/noisy regimes.
+        t0 = time.perf_counter()
+        _append_candidate(
+            "consensus_majority",
+            _consensus_baseline_newick(gene_trees, all_taxa),
+            float(time.perf_counter() - t0),
+        )
+    if baseline_guardrail and external_candidates:
+        for name, nwk in external_candidates:
+            if not name or not nwk:
+                continue
+            _append_candidate(str(name), str(nwk), 0.0)
     rng_local = np.random.default_rng(20260219)
     guardrail_score_max_quintets = max_quintets_per_tree
     if guardrail_score_max_quintets is not None and len(all_taxa) >= 24:
@@ -418,21 +710,110 @@ def infer_species_tree_newick_phase2(
         gene_trees=gene_trees,
         sampled_subsets_by_gene=sampled_subsets_by_gene,
     )
-    scored = [
-        (
-            _score_species_tree_newick_cached(
+    gene_weights_by_id = (
+        {id(gt): float(robust_gene_weights[i]) for i, gt in enumerate(gene_trees)}
+        if robust_gene_weights is not None
+        else None
+    )
+    scored: list[tuple[float, int, str, str, float, float]] = []
+    for c in candidates:
+        name = str(c["name"])
+        nwk = str(c["newick"])
+        t0 = time.perf_counter()
+        score = _score_species_tree_newick_cached(
+            gene_trees=gene_trees,
+            species_tree_newick=nwk,
+            sampled_subsets_by_gene=sampled_subsets_by_gene,
+            gene_topology_cache=gene_topology_cache,
+            gene_weights_by_id=gene_weights_by_id,
+        )
+        score_runtime = float(time.perf_counter() - t0)
+        generation_runtime = float(c.get("generation_runtime_s", 0.0))
+        scored.append((float(score), 1 if name == "phase2" else 0, nwk, name, generation_runtime, score_runtime))
+    best_score = max(s[0] for s in scored)
+    top = [s for s in scored if s[0] >= best_score - 1e-12]
+    def _name_priority(name: str) -> int:
+        if name.startswith("phase2_hires_q"):
+            return 50
+        if name == "phase2":
+            return 40
+        if name == "consensus_majority":
+            return 30
+        if name == "upgma":
+            return 20
+        if name == "nj":
+            return 10
+        return 0
+    # Deterministic quick-stage winner.
+    winner = max(top, key=lambda s: (_name_priority(s[3]), s[3]))
+
+    msc_by_name: dict[str, float] = {}
+    msc_runtime_by_name: dict[str, float] = {}
+    # Large taxa: refine candidate selection with MSC likelihood scoring after
+    # branch-length optimization on top quick-stage candidates. In standalone
+    # core mode we score all internal candidates to reduce Phase2 overfitting.
+    if len(all_taxa) >= 24 and observations:
+        top_k = 2 if baseline_guardrail else len(scored)
+        top_quick = sorted(scored, key=lambda s: (s[0], _name_priority(s[3]), s[3]), reverse=True)[:top_k]
+        for _qscore, _pref, nwk, name, _gen_rt, _q_rt in top_quick:
+            t0 = time.perf_counter()
+            ml_tree = optimize_branch_lengths_ml(_read_tree(nwk), observations)
+            ml_newick = ml_tree.newick()
+            msc_score = _score_species_tree_newick_msc_cached(
                 gene_trees=gene_trees,
-                species_tree_newick=nwk,
+                species_tree_newick=ml_newick,
                 sampled_subsets_by_gene=sampled_subsets_by_gene,
                 gene_topology_cache=gene_topology_cache,
-            ),
-            1 if name == "phase2" else 0,
-            nwk,
+                gene_weights_by_id=gene_weights_by_id,
+            )
+            msc_by_name[name] = float(msc_score)
+            msc_runtime_by_name[name] = float(time.perf_counter() - t0)
+        if msc_by_name:
+            best_name = max(msc_by_name, key=lambda n: (msc_by_name[n], _name_priority(n), n))
+            winner = next(s for s in scored if s[3] == best_name)
+    # External-candidate preference on full-taxa inputs:
+    # avoid selecting consensus on near-ties when external methods are present.
+    has_no_missing = all(len(get_leaf_set(gt).intersection(all_taxa)) == len(all_taxa) for gt in gene_trees)
+    by_name = {s[3]: s for s in scored}
+    external_present = [n for n in ("tree_qmc", "astral") if n in by_name]
+    if baseline_guardrail and has_no_missing and winner[3] == "consensus_majority" and external_present:
+        best_external = max(
+            (by_name[n] for n in external_present),
+            key=lambda s: (s[0], 1 if s[3] == "tree_qmc" else 0, s[3]),
         )
-        for name, nwk in candidates
-    ]
-    scored.sort(reverse=True)
-    return str(scored[0][2])
+        # Consensus is brittle on some asymmetric/full-taxa regimes; if an
+        # external candidate is close, prefer the external candidate.
+        if (winner[0] - best_external[0]) <= 0.02:
+            winner = best_external
+    # If ASTRAL narrowly beats TREE-QMC, prefer TREE-QMC as a conservative
+    # tie-break on full-taxa inputs.
+    if baseline_guardrail and has_no_missing and "astral" in by_name and "tree_qmc" in by_name:
+        a = by_name["astral"]
+        t = by_name["tree_qmc"]
+        if winner[3] == "astral" and (a[0] - t[0]) <= 0.015:
+            winner = t
+    if guardrail_diagnostics is not None:
+        guardrail_diagnostics.clear()
+        guardrail_diagnostics["winner"] = {
+            "name": winner[3],
+            "score": winner[0],
+            "msc_score": msc_by_name.get(winner[3]),
+        }
+        guardrail_diagnostics["candidates"] = [
+            {
+                "name": name,
+                "score": score,
+                "msc_score": msc_by_name.get(name),
+                "generation_runtime_s": gen_rt,
+                "score_runtime_s": sc_rt,
+                "msc_runtime_s": msc_runtime_by_name.get(name),
+                "total_runtime_s": gen_rt + sc_rt,
+            }
+            for score, _pref, _nwk, name, gen_rt, sc_rt in scored
+        ]
+        guardrail_diagnostics["n_taxa"] = len(all_taxa)
+        guardrail_diagnostics["max_quintets_per_tree"] = max_quintets_per_tree
+    return str(winner[2])
 
 
 def infer_species_tree_newick_phase4_em(

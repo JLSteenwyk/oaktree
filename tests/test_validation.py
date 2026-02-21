@@ -48,6 +48,7 @@ def test_run_baseline_benchmark_structure():
         assert r.nj_rf >= 0
         assert r.upgma_rf >= 0
         assert (r.astral_rf is None) or (r.astral_rf >= 0)
+        assert (r.tree_qmc_rf is None) or (r.tree_qmc_rf >= 0)
         assert r.n_gene_trees == 40
 
 
@@ -74,6 +75,7 @@ def test_run_expanded_benchmark_structure():
         assert r.nj_rf >= 0
         assert r.upgma_rf >= 0
         assert (r.astral_rf is None) or (r.astral_rf >= 0)
+        assert (r.tree_qmc_rf is None) or (r.tree_qmc_rf >= 0)
 
 
 def test_run_expanded_benchmark_core_mode_structure():
@@ -96,6 +98,7 @@ def test_summarize_rf_replicates_stats():
         nj_rf=1,
         upgma_rf=1,
         astral_rf=None,
+        tree_qmc_rf=None,
         phase2_newick="(A,B);",
         phase4_newick="(A,B);",
         consensus_newick="(A,B);",
@@ -103,6 +106,7 @@ def test_summarize_rf_replicates_stats():
         nj_newick="(A,B);",
         upgma_newick="(A,B);",
         astral_newick=None,
+        tree_qmc_newick=None,
         true_newick="(A,B);",
     )
     r2 = BenchmarkResult(
@@ -115,6 +119,7 @@ def test_summarize_rf_replicates_stats():
         nj_rf=3,
         upgma_rf=3,
         astral_rf=None,
+        tree_qmc_rf=None,
         phase2_newick="(A,B);",
         phase4_newick="(A,B);",
         consensus_newick="(A,B);",
@@ -122,6 +127,7 @@ def test_summarize_rf_replicates_stats():
         nj_newick="(A,B);",
         upgma_newick="(A,B);",
         astral_newick=None,
+        tree_qmc_newick=None,
         true_newick="(A,B);",
     )
     agg = summarize_rf_replicates([[r1], [r2]])
