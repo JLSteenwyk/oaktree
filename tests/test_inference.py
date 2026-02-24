@@ -11,6 +11,7 @@ import treeswift
 from oaktree.graphs import partition_tree_to_newick
 from oaktree.inference import (
     _compute_robust_gene_weights,
+    _generate_nni_neighbors_newicks,
     extract_quintet_observations_from_gene_trees,
     extract_projected_quintet_observations_from_higher_order,
     infer_species_tree_newick_phase2,
@@ -385,3 +386,16 @@ def test_robust_gene_weights_downweight_low_coverage_outliers():
     high_cov = float(np.mean(w[:8]))
     low_cov = float(np.mean(w[8:]))
     assert high_cov > low_cov
+
+
+def test_generate_nni_neighbors_preserves_taxa_and_changes_topology():
+    base = "((((A,B),(C,D)),((E,F),(G,H))),((I,J),(K,L)));"
+    neigh = _generate_nni_neighbors_newicks(base, max_neighbors=8)
+    assert len(neigh) > 0
+    base_tree = _read_tree(base)
+    base_leaves = sorted(str(n.label) for n in base_tree.traverse_leaves())
+    assert any(nw != base for nw in neigh)
+    for nw in neigh:
+        tr = _read_tree(nw)
+        leaves = sorted(str(n.label) for n in tr.traverse_leaves())
+        assert leaves == base_leaves

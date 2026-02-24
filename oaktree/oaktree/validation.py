@@ -734,7 +734,7 @@ def run_baseline_benchmark(
         if tree_qmc_pre is not None:
             external_candidates.append(("tree_qmc", tree_qmc_pre))
         rng = np.random.default_rng(seed + 100 + i)
-        p2_diag: dict[str, object] | None = {} if baseline_guardrail else None
+        p2_diag: dict[str, object] | None = {}
         p2 = infer_species_tree_newick_phase2(
             genes,
             taxa=taxa,
@@ -859,7 +859,7 @@ def run_expanded_benchmark(
         if tree_qmc_pre is not None:
             external_candidates.append(("tree_qmc", tree_qmc_pre))
 
-        p2_diag: dict[str, object] | None = {} if baseline_guardrail else None
+        p2_diag: dict[str, object] | None = {}
         p2 = infer_species_tree_newick_phase2(
             genes,
             taxa=taxa,
@@ -983,7 +983,7 @@ def run_scaled16_quick_benchmark(
         if tree_qmc_pre is not None:
             external_candidates.append(("tree_qmc", tree_qmc_pre))
 
-        p2_diag: dict[str, object] | None = {} if baseline_guardrail else None
+        p2_diag: dict[str, object] | None = {}
         p2 = infer_species_tree_newick_phase2(
             genes,
             taxa=taxa,
@@ -1107,7 +1107,7 @@ def run_scaled64_complex_benchmark(
         if tree_qmc_pre is not None:
             external_candidates.append(("tree_qmc", tree_qmc_pre))
 
-        p2_diag: dict[str, object] | None = {} if baseline_guardrail else None
+        p2_diag: dict[str, object] | None = {}
         p2 = infer_species_tree_newick_phase2(
             genes,
             taxa=taxa,

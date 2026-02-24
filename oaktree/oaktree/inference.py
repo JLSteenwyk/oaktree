@@ -485,6 +485,64 @@ def _distance_baseline_newick(
     return tree.as_string(schema="newick").strip()
 
 
+def _node_leaf_signatures(tree: treeswift.Tree) -> dict[treeswift.Node, tuple[str, ...]]:
+    sig: dict[treeswift.Node, tuple[str, ...]] = {}
+    for node in tree.root.traverse_postorder():
+        if node.is_leaf():
+            sig[node] = (str(node.label),)
+        else:
+            leaves: list[str] = []
+            for ch in node.children:
+                leaves.extend(sig[ch])
+            sig[node] = tuple(sorted(leaves))
+    return sig
+
+
+def _generate_nni_neighbors_newicks(base_newick: str, *, max_neighbors: int = 16) -> list[str]:
+    """Generate bounded rooted-NNI neighbors via child/sibling swaps."""
+    tr = _read_tree(base_newick)
+    sig = _node_leaf_signatures(tr)
+    seen: set[str] = set()
+    out: list[str] = []
+    for parent in tr.root.traverse_preorder():
+        if parent.is_leaf() or len(parent.children) != 2:
+            continue
+        left, right = parent.children[0], parent.children[1]
+        for child, sibling in ((left, right), (right, left)):
+            if child.is_leaf() or len(child.children) != 2:
+                continue
+            c1, c2 = child.children[0], child.children[1]
+            for sub in (c1, c2):
+                t2 = _read_tree(base_newick)
+                sig2 = _node_leaf_signatures(t2)
+                # Resolve nodes in cloned tree by clade signature.
+                by_sig = {v: k for k, v in sig2.items()}
+                p2 = by_sig.get(sig[parent])
+                c2_node = by_sig.get(sig[child])
+                s2 = by_sig.get(sig[sibling])
+                sub2 = by_sig.get(sig[sub])
+                if p2 is None or c2_node is None or s2 is None or sub2 is None:
+                    continue
+                if sub2.parent is not c2_node:
+                    continue
+                if s2.parent is not p2:
+                    continue
+                # Swap one child of c2_node with its sibling branch at p2.
+                c2_node.remove_child(sub2)
+                p2.remove_child(s2)
+                c2_node.add_child(s2)
+                p2.add_child(sub2)
+                t2.suppress_unifurcations()
+                nwk = t2.newick()
+                if nwk in seen or nwk == base_newick:
+                    continue
+                seen.add(nwk)
+                out.append(nwk)
+                if len(out) >= int(max_neighbors):
+                    return out
+    return out
+
+
 def _consensus_baseline_newick(
     gene_trees: Sequence[treeswift.Tree],
     taxa: Sequence[str],
@@ -512,6 +570,97 @@ def _consensus_baseline_newick(
     return cons.as_string(schema="newick").strip()
 
 
+def _canonical_split(subset: set[str], taxa_set: set[str]) -> tuple[str, ...]:
+    other = taxa_set - subset
+    side = subset if len(subset) <= len(other) else other
+    return tuple(sorted(side))
+
+
+def _tree_internal_splits(tree: treeswift.Tree, taxa_set: set[str]) -> set[tuple[str, ...]]:
+    parent: dict[treeswift.Node, treeswift.Node | None] = {tree.root: None}
+    for node in tree.root.traverse_preorder():
+        for ch in node.children:
+            parent[ch] = node
+    leaf_sets: dict[treeswift.Node, set[str]] = {}
+    for node in tree.root.traverse_postorder():
+        if node.is_leaf():
+            leaf_sets[node] = {str(node.label)}
+        else:
+            s: set[str] = set()
+            for ch in node.children:
+                s |= leaf_sets[ch]
+            leaf_sets[node] = s
+    splits: set[tuple[str, ...]] = set()
+    n = len(taxa_set)
+    for node, subset in leaf_sets.items():
+        if node is tree.root:
+            continue
+        if len(subset) <= 1 or len(subset) >= n - 1:
+            continue
+        splits.add(_canonical_split(set(subset), taxa_set))
+    return splits
+
+
+def _prepare_gene_split_cache(
+    gene_trees: Sequence[treeswift.Tree],
+    taxa: Sequence[str],
+) -> tuple[dict[int, set[tuple[str, ...]]], dict[int, set[str]]]:
+    taxa_use = set(str(t) for t in taxa)
+    split_cache: dict[int, set[tuple[str, ...]]] = {}
+    present_cache: dict[int, set[str]] = {}
+    for gt in gene_trees:
+        present = set(str(t) for t in get_leaf_set(gt) if str(t) in taxa_use)
+        present_cache[id(gt)] = present
+        if len(present) < 4:
+            split_cache[id(gt)] = set()
+            continue
+        induced = gt.extract_tree_with(present, suppress_unifurcations=True)
+        split_cache[id(gt)] = _tree_internal_splits(induced, present)
+    return split_cache, present_cache
+
+
+def _split_support_score_species_tree(
+    species_tree_newick: str,
+    taxa: Sequence[str],
+    gene_trees: Sequence[treeswift.Tree],
+    *,
+    gene_split_cache: dict[int, set[tuple[str, ...]]],
+    gene_present_cache: dict[int, set[str]],
+    gene_weights_by_id: dict[int, float] | None = None,
+) -> float:
+    taxa_set = set(str(t) for t in taxa)
+    st = _read_tree(species_tree_newick)
+    species_splits = _tree_internal_splits(st, taxa_set)
+    if not species_splits:
+        return 0.0
+    split_scores: list[float] = []
+    for split in species_splits:
+        a = set(split)
+        num = 0.0
+        den = 0.0
+        for gt in gene_trees:
+            gid = id(gt)
+            gw = float(gene_weights_by_id.get(gid, 1.0)) if gene_weights_by_id is not None else 1.0
+            if gw <= 0.0:
+                continue
+            present = gene_present_cache.get(gid, set())
+            if len(present) < 4:
+                continue
+            left = a.intersection(present)
+            right = present - left
+            if len(left) < 2 or len(right) < 2:
+                continue
+            proj = _canonical_split(set(left), set(present))
+            den += gw
+            if proj in gene_split_cache.get(gid, set()):
+                num += gw
+        if den > 0.0:
+            split_scores.append(num / den)
+    if not split_scores:
+        return 0.0
+    return float(np.mean(np.asarray(split_scores, dtype=float)))
+
+
 def infer_species_tree_newick_phase2(
     gene_trees: Sequence[treeswift.Tree],
     taxa: Sequence[str] | None = None,
@@ -528,6 +677,7 @@ def infer_species_tree_newick_phase2(
     higher_order_subsets_per_tree: int = 0,
     higher_order_quintets_per_subset: int = 0,
     higher_order_weight: float = 1.0,
+    core_local_search: bool = False,
     guardrail_diagnostics: dict[str, object] | None = None,
     external_candidates: Sequence[tuple[str, str]] | None = None,
 ) -> str:
@@ -715,6 +865,12 @@ def infer_species_tree_newick_phase2(
         if robust_gene_weights is not None
         else None
     )
+    split_support_cache_by_newick: dict[str, float] = {}
+    gene_split_cache: dict[int, set[tuple[str, ...]]] | None = None
+    gene_present_cache: dict[int, set[str]] | None = None
+    if len(all_taxa) >= 24 and not baseline_guardrail:
+        gene_split_cache, gene_present_cache = _prepare_gene_split_cache(gene_trees, all_taxa)
+    has_no_missing = all(len(get_leaf_set(gt).intersection(all_taxa)) == len(all_taxa) for gt in gene_trees)
     scored: list[tuple[float, int, str, str, float, float]] = []
     for c in candidates:
         name = str(c["name"])
@@ -730,6 +886,58 @@ def infer_species_tree_newick_phase2(
         score_runtime = float(time.perf_counter() - t0)
         generation_runtime = float(c.get("generation_runtime_s", 0.0))
         scored.append((float(score), 1 if name == "phase2" else 0, nwk, name, generation_runtime, score_runtime))
+    # Core-only local topology refinement: explore bounded NNI neighborhoods
+    # from robust seed candidates with shallow hill-climbing.
+    local_search_added = 0
+    if core_local_search and len(all_taxa) >= 24 and not baseline_guardrail and observations:
+        by_name_pre = {s[3]: s for s in scored}
+        seed_list: list[tuple[float, int, str, str, float, float]] = []
+        for preferred in ("nj", "upgma", "consensus_majority"):
+            if preferred in by_name_pre:
+                seed_list.append(by_name_pre[preferred])
+        for s in sorted(scored, key=lambda x: (x[0], x[1], x[3]), reverse=True):
+            if s not in seed_list:
+                seed_list.append(s)
+            if len(seed_list) >= 4:
+                break
+        scored_by_newick: dict[str, tuple[float, int, str, str, float, float]] = {s[2]: s for s in scored}
+        max_neighbors = 10 if has_no_missing else 16
+        max_depth = 1 if has_no_missing else 2
+        for seed in seed_list:
+            current_score, _pref, current_nwk, seed_name, _grt, _srt = seed
+            for depth in range(max_depth):
+                best_score = float(current_score)
+                best_nwk = str(current_nwk)
+                neighbors = _generate_nni_neighbors_newicks(current_nwk, max_neighbors=max_neighbors)
+                for i, nnwk in enumerate(neighbors, start=1):
+                    existing = scored_by_newick.get(nnwk)
+                    if existing is not None:
+                        nscore = float(existing[0])
+                        if nscore > best_score + 1e-9:
+                            best_score = nscore
+                            best_nwk = nnwk
+                        continue
+                    nname = f"{seed_name}_nni_d{depth+1}_{i}"
+                    t0 = time.perf_counter()
+                    nscore = _score_species_tree_newick_cached(
+                        gene_trees=gene_trees,
+                        species_tree_newick=nnwk,
+                        sampled_subsets_by_gene=sampled_subsets_by_gene,
+                        gene_topology_cache=gene_topology_cache,
+                        gene_weights_by_id=gene_weights_by_id,
+                    )
+                    nscore_runtime = float(time.perf_counter() - t0)
+                    tup = (float(nscore), 0, nnwk, nname, 0.0, nscore_runtime)
+                    scored.append(tup)
+                    scored_by_newick[nnwk] = tup
+                    local_search_added += 1
+                    if float(nscore) > best_score + 1e-9:
+                        best_score = float(nscore)
+                        best_nwk = nnwk
+                if best_nwk == current_nwk:
+                    break
+                current_nwk = best_nwk
+                current_score = best_score
     best_score = max(s[0] for s in scored)
     top = [s for s in scored if s[0] >= best_score - 1e-12]
     def _name_priority(name: str) -> int:
@@ -746,14 +954,38 @@ def infer_species_tree_newick_phase2(
         return 0
     # Deterministic quick-stage winner.
     winner = max(top, key=lambda s: (_name_priority(s[3]), s[3]))
+    winner_trace: list[str] = [f"quick_stage:{winner[3]}"]
+
+    split_support_by_name: dict[str, float] = {}
+    split_support_runtime_by_name: dict[str, float] = {}
+    if len(all_taxa) >= 24 and not baseline_guardrail and gene_split_cache is not None and gene_present_cache is not None:
+        top_split = sorted(scored, key=lambda s: (s[0], _name_priority(s[3]), s[3]), reverse=True)[:8]
+        for _qscore, _pref, nwk, name, _gen_rt, _q_rt in top_split:
+            t0 = time.perf_counter()
+            ss = _split_support_score_species_tree(
+                nwk,
+                all_taxa,
+                gene_trees,
+                gene_split_cache=gene_split_cache,
+                gene_present_cache=gene_present_cache,
+                gene_weights_by_id=gene_weights_by_id,
+            )
+            split_support_cache_by_newick[nwk] = float(ss)
+            split_support_by_name[name] = float(ss)
+            split_support_runtime_by_name[name] = float(time.perf_counter() - t0)
+        if split_support_by_name:
+            best_name = max(split_support_by_name, key=lambda n: (split_support_by_name[n], _name_priority(n), n))
+            winner = next(s for s in scored if s[3] == best_name)
+            winner_trace.append(f"split_support_stage:{winner[3]}")
 
     msc_by_name: dict[str, float] = {}
     msc_runtime_by_name: dict[str, float] = {}
+    combined_by_name: dict[str, float] = {}
     # Large taxa: refine candidate selection with MSC likelihood scoring after
     # branch-length optimization on top quick-stage candidates. In standalone
     # core mode we score all internal candidates to reduce Phase2 overfitting.
     if len(all_taxa) >= 24 and observations:
-        top_k = 2 if baseline_guardrail else len(scored)
+        top_k = 2 if baseline_guardrail else min(len(scored), 6)
         top_quick = sorted(scored, key=lambda s: (s[0], _name_priority(s[3]), s[3]), reverse=True)[:top_k]
         for _qscore, _pref, nwk, name, _gen_rt, _q_rt in top_quick:
             t0 = time.perf_counter()
@@ -769,11 +1001,35 @@ def infer_species_tree_newick_phase2(
             msc_by_name[name] = float(msc_score)
             msc_runtime_by_name[name] = float(time.perf_counter() - t0)
         if msc_by_name:
-            best_name = max(msc_by_name, key=lambda n: (msc_by_name[n], _name_priority(n), n))
+            # Core standalone: blend MSC with split-support to avoid objective
+            # overfitting on short-branch/missing-data regimes.
+            if not baseline_guardrail and split_support_by_name:
+                names = list(msc_by_name.keys())
+                mvals = np.asarray([float(msc_by_name[n]) for n in names], dtype=float)
+                svals = np.asarray([float(split_support_by_name.get(n, 0.0)) for n in names], dtype=float)
+                mmin, mmax = float(np.min(mvals)), float(np.max(mvals))
+                smin, smax = float(np.min(svals)), float(np.max(svals))
+                if mmax > mmin:
+                    mnorm = (mvals - mmin) / (mmax - mmin)
+                else:
+                    mnorm = np.zeros_like(mvals)
+                if smax > smin:
+                    snorm = (svals - smin) / (smax - smin)
+                else:
+                    snorm = np.zeros_like(svals)
+                # Favor MSC but retain substantial split-support influence.
+                alpha = 0.65
+                blend = alpha * mnorm + (1.0 - alpha) * snorm
+                for i, n in enumerate(names):
+                    combined_by_name[n] = float(blend[i])
+                best_name = max(names, key=lambda n: (combined_by_name[n], _name_priority(n), n))
+                winner_trace.append(f"combined_stage:{best_name}")
+            else:
+                best_name = max(msc_by_name, key=lambda n: (msc_by_name[n], _name_priority(n), n))
             winner = next(s for s in scored if s[3] == best_name)
+            winner_trace.append(f"msc_stage:{winner[3]}")
     # External-candidate preference on full-taxa inputs:
     # avoid selecting consensus on near-ties when external methods are present.
-    has_no_missing = all(len(get_leaf_set(gt).intersection(all_taxa)) == len(all_taxa) for gt in gene_trees)
     by_name = {s[3]: s for s in scored}
     external_present = [n for n in ("tree_qmc", "astral") if n in by_name]
     if baseline_guardrail and has_no_missing and winner[3] == "consensus_majority" and external_present:
@@ -785,6 +1041,7 @@ def infer_species_tree_newick_phase2(
         # external candidate is close, prefer the external candidate.
         if (winner[0] - best_external[0]) <= 0.02:
             winner = best_external
+            winner_trace.append(f"external_preference:{winner[3]}")
     # If ASTRAL narrowly beats TREE-QMC, prefer TREE-QMC as a conservative
     # tie-break on full-taxa inputs.
     if baseline_guardrail and has_no_missing and "astral" in by_name and "tree_qmc" in by_name:
@@ -792,6 +1049,7 @@ def infer_species_tree_newick_phase2(
         t = by_name["tree_qmc"]
         if winner[3] == "astral" and (a[0] - t[0]) <= 0.015:
             winner = t
+            winner_trace.append("astral_to_tree_qmc_tiebreak")
     if guardrail_diagnostics is not None:
         guardrail_diagnostics.clear()
         guardrail_diagnostics["winner"] = {
@@ -799,13 +1057,25 @@ def infer_species_tree_newick_phase2(
             "score": winner[0],
             "msc_score": msc_by_name.get(winner[3]),
         }
+        guardrail_diagnostics["winner_trace"] = list(winner_trace)
+        guardrail_diagnostics["selection_context"] = {
+            "baseline_guardrail": bool(baseline_guardrail),
+            "core_local_search": bool(core_local_search),
+            "core_local_search_added_candidates": int(local_search_added),
+            "has_no_missing": bool(has_no_missing),
+            "external_present": list(external_present),
+            "n_candidates_scored": int(len(scored)),
+        }
         guardrail_diagnostics["candidates"] = [
             {
                 "name": name,
                 "score": score,
+                "split_support_score": split_support_by_name.get(name),
                 "msc_score": msc_by_name.get(name),
+                "combined_score": combined_by_name.get(name),
                 "generation_runtime_s": gen_rt,
                 "score_runtime_s": sc_rt,
+                "split_support_runtime_s": split_support_runtime_by_name.get(name),
                 "msc_runtime_s": msc_runtime_by_name.get(name),
                 "total_runtime_s": gen_rt + sc_rt,
             }

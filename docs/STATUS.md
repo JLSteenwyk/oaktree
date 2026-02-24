@@ -133,8 +133,27 @@ Update this file when a milestone’s tests are green. Keep dates in YYYY-MM-DD.
     - Current optimization direction:
       - Core Phase 2 remains the primary quality bottleneck on larger taxa regimes.
       - Guardrailed path has acceptable quality on 32/64 taxa but remains significantly slower than ASTRAL.
+    - Added TREE-QMC external baseline integration and reporting support:
+      - `scripts/benchmark.py` supports `--tree-qmc-bin` and timeout control.
+      - `scripts/report_validation.py` includes TREE-QMC series in summary output.
+      - TREE-QMC input sanitization (annotations/branch lengths/internal labels stripped) added for robust execution.
+    - Added scaled 64-taxon complex benchmark mode:
+      - Regimes: `balanced64`, `asymmetric64`, `shortbranch64`, `balanced64_missing`, `shortbranch64_missing_noisy`.
+    - Added Phase 2 guardrail diagnostics and expanded candidate-bank logic:
+      - Winner + candidate score/runtime payload for each run.
+      - Internal candidates include Phase2/NJ/UPGMA/consensus and higher-budget Phase2 variants.
+    - Added standalone-core robustness experiments (no external-candidate injection):
+      - Missingness-aware and outlier-robust per-gene weights for quintet extraction/scoring.
+      - Tighter confidence-shrink policy for large-taxa core mode.
+      - Additional core candidate-policy sweep for large taxa.
+    - Latest standalone-core 64x220 snapshot (`tables/validation_scaled64_complex_g220_r1_core_vs_astral_robustw_v3_fastci.json`):
+      - `balanced64`: Phase2 RF `1`, ASTRAL RF `1` (tie)
+      - `asymmetric64`: Phase2 RF `2`, ASTRAL RF `2` (tie)
+      - `shortbranch64`: Phase2 RF `38`, ASTRAL RF `13` (ASTRAL better)
+      - `balanced64_missing`: Phase2 RF `0`, ASTRAL RF `1` (OAKTREE better)
+      - `shortbranch64_missing_noisy`: Phase2 RF `67`, ASTRAL RF `11` (ASTRAL much better)
+      - Result: robustness patches did not change RF vs previous core baseline on this run.
 
 ## Current Suite
-- Latest targeted run: `./venv/bin/pytest -q tests/test_inference.py tests/test_validation.py` (`18 passed, 1 failed`)
-- Failing test: `tests/test_inference.py::test_phase2_default_policy_matches_explicit_adaptive_noisy`
-- Date: 2026-02-20
+- Latest targeted run: `./venv/bin/pytest -q tests/test_inference.py tests/test_validation.py` (`20 passed`)
+- Date: 2026-02-21

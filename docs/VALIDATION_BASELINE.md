@@ -275,3 +275,26 @@ Summary (single-run RF/runtime):
 Interpretation:
 - Accuracy is competitive with ASTRAL/NJ on this run (all RF `1`) but not yet beyond UPGMA (RF `0`).
 - Runtime gap vs ASTRAL remains large at 64 taxa.
+
+## Scaled64 Complex Core-vs-ASTRAL (Standalone) Snapshot (2026-02-20/21)
+
+Command run:
+
+```bash
+PYTHONPATH=oaktree ./venv/bin/python scripts/benchmark.py --scaled64-complex --n-gene-trees 220 --seed 21 --replicates 1 --ci-bootstrap-samples 2 --guardrail-mode core --astral-jar /mnt/ca1e2e99-718e-417c-9ba6-62421455971a/SOFTWARE/Astral/astral.5.7.8.jar --output tables/validation_scaled64_complex_g220_r1_core_vs_astral_robustw_v3_fastci.json
+```
+
+Summary (RF to known true topology):
+
+- `balanced64`: Phase 2 `1`, ASTRAL `1` (tie)
+- `asymmetric64`: Phase 2 `2`, ASTRAL `2` (tie)
+- `shortbranch64`: Phase 2 `38`, ASTRAL `13` (ASTRAL better)
+- `balanced64_missing`: Phase 2 `0`, ASTRAL `1` (OAKTREE better)
+- `shortbranch64_missing_noisy`: Phase 2 `67`, ASTRAL `11` (ASTRAL much better)
+
+Artifacts:
+- `tables/validation_scaled64_complex_g220_r1_core_vs_astral_v2_fastci.json`
+- `tables/validation_scaled64_complex_g220_r1_core_vs_astral_robustw_v3_fastci.json`
+
+Key finding:
+- Recent standalone-core robustness patches (coverage/outlier-aware gene weighting, weighted selector scoring, tighter large-taxa confidence shrink) produced **no RF change** on this run relative to the previous core fast-CI baseline.

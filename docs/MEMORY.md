@@ -63,6 +63,11 @@ This file is the long-term memory for the project. It captures constraints, desi
   - guardrailed large-taxa budget floors in candidate construction/scoring
   - Phase 4 large-taxa topology-freeze behavior (branch-length optimization without topology moves)
   - topology-change acceptance gating for large-taxa guardrailed EM proposals
+- 2026-02-21: Added expanded Phase 6 baseline/benchmark support:
+  - TREE-QMC external baseline runner + reporting support
+  - 64-taxon complex benchmark mode (`balanced64`, `asymmetric64`, `shortbranch64`, `balanced64_missing`, `shortbranch64_missing_noisy`)
+  - Phase 2 guardrail diagnostics and optional external-candidate injection path
+  - standalone-core robustness experiments (missingness/outlier-aware gene weights, weighted selector scoring, stricter confidence shrink)
 
 ## Profiling baselines
 - 2026-02-19 lookup precompute baseline (`scripts/profile_lookup_tables.py`, max_tau=2.0, all 15 species topologies):
@@ -91,9 +96,14 @@ This file is the long-term memory for the project. It captures constraints, desi
     - phase2_guardrailed ~51.45s; phase4_guardrailed_i4 ~70.75s; astral ~2.23s
 
 ## Current validation snapshot
-- 2026-02-20 targeted suite: `./venv/bin/pytest -q tests/test_inference.py tests/test_validation.py` -> 18 passed, 1 failed.
-- Current failing test:
-  - `tests/test_inference.py::test_phase2_default_policy_matches_explicit_adaptive_noisy`
+- 2026-02-21 targeted suite: `./venv/bin/pytest -q tests/test_inference.py tests/test_validation.py` -> 20 passed.
+- Latest standalone-core 64x220 result (`tables/validation_scaled64_complex_g220_r1_core_vs_astral_robustw_v3_fastci.json`):
+  - balanced64: Phase2 RF 1 vs ASTRAL 1
+  - asymmetric64: Phase2 RF 2 vs ASTRAL 2
+  - shortbranch64: Phase2 RF 38 vs ASTRAL 13
+  - balanced64_missing: Phase2 RF 0 vs ASTRAL 1
+  - shortbranch64_missing_noisy: Phase2 RF 67 vs ASTRAL 11
+  - robust-weighting patches did not change RF vs previous core fast-CI baseline on this seed/run.
 - 2026-02-19 validation artifacts:
   - `tables/validation_expanded.json`
   - `tables/validation_expanded_summary.md`
